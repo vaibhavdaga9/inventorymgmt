@@ -1,0 +1,1042 @@
+<script>
+/* =========================================================
+ * Inventory Dashboard — client controller
+ * Uses google.script.run + SheetJS for Excel parse/download
+ * ========================================================= */
+
+const state = {
+  masters: { skus: [], brands: [], orderTypes: [], customers: [] },
+  outward: [],
+  physical: [],
+  compare: [],
+  outCompare: [],
+  orders: [],
+  reorder: [],
+  mslRows: [],
+  outwardParsed: null,
+  tallyParsed: null,
+  orderParsed: null,
+  inwardParsed: null,
+  pendingItems: [],
+  lastSummary: null,
+  activeTab: 'dashboard',
+  brandSkuDesc: {},
+};
+
+/* --------- helpers --------- */
+function $(id) { return document.getElementById(id); }
+function toast(msg, kind = 'info') {
+  const t = $('toast');
+  t.className = 'toast show ' + kind;
+  t.textContent = msg;
+  clearTimeout(window._toastT);
+  window._toastT = setTimeout(() => t.classList.remove('show'), 3200);
+}
+function callGS(fn, ...args) {
+  return new Promise((resolve, reject) => {
+    google.script.run.withSuccessHandler(resolve).withFailureHandler(err => {
+      console.error('GS error:', err);
+      reject(err);
+    })[fn](...args);
+  });
+}
+function fmtNum(n) { return (Number(n) || 0).toLocaleString(); }
+function fmtSigned(n) { const v = Number(n) || 0; return (v > 0 ? '+' : '') + v.toLocaleString(); }
+function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function todayISO() { return new Date().toISOString().slice(0, 10); }
+
+function rowClass(status) {
+  if (status === 'EXCESS' || status === 'OVER SCANNED') return 'diff-excess';
+  if (status === 'SHORT' || status === 'UNDER SCANNED') return 'diff-short';
+  if (status === 'MISSING PHYSICAL' || status === 'MISSING BOOK' ||
+      status === 'SCAN WITHOUT BILL' || status === 'BILL WITHOUT SCAN') return 'diff-miss';
+  if (status === 'PURCHASE PENDING' || status === 'CUSTOMER RETURN') return 'diff-short';
+  return '';
+}
+function statusPill(s) {
+  const map = {
+    'MATCH': 'ok',
+    'EXCESS': 'info', 'SHORT': 'hot',
+    'OVER SCANNED': 'info', 'UNDER SCANNED': 'hot',
+    'MISSING PHYSICAL': 'warn', 'MISSING BOOK': 'warn',
+    'SCAN WITHOUT BILL': 'warn', 'BILL WITHOUT SCAN': 'warn',
+    'PURCHASE PENDING': 'hot', 'CUSTOMER RETURN': 'info',
+    'NOT ORDERED': 'hot',
+    'Pending': 'hot', 'Partial': 'warn', 'Completed': 'ok',
+  };
+  return `<span class="pill ${map[s] || 'info'}">${s}</span>`;
+}
+
+/* --------- tab switching --------- */
+document.querySelectorAll('.nav-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    btn.classList.add('active');
+    const tab = btn.dataset.tab;
+    state.activeTab = tab;
+    $('tab-' + tab).classList.add('active');
+    const titles = {
+      dashboard: ['Dashboard', "Snapshot for the selected date — defaults to today."],
+      outward:   ['Scanned Upload', 'Upload scanned outward. Same-date uploads accumulate.'],
+      physical:  ['Physical Stock', 'Enter In Open + In Box per SKU for the selected date.'],
+      compare:   ['Stock Comparison', 'Compare scanned vs book outward, and physical vs closing.'],
+      msl:       ['MSL & Reorder', 'Sales-based MSL suggestion. Edit MSL inline to override.'],
+      orders:    ['Purchase Orders', 'Place, upload and filter orders.'],
+      inward:    ['Received Material', 'Receive against open orders. Un-ordered receipts flagged.'],
+      summary:   ['Order Summary', 'Filter and expand orders by customer.'],
+      masters:   ['Masters', 'Manage SKUs, brands, order types, customers.'],
+    };
+    $('page-title').textContent = titles[tab][0];
+    $('page-sub').textContent = titles[tab][1];
+    onTabShow(tab);
+  });
+});
+
+function onTabShow(tab) {
+  if (tab === 'dashboard') loadDashboard();
+  else if (tab === 'outward')  { loadScannedForDate(); }
+  else if (tab === 'physical') renderPhysical();
+  else if (tab === 'compare')  loadComparison();
+  else if (tab === 'msl')      { calcMSL(false); loadReorder(); }
+  else if (tab === 'orders')   { renderOrderForm(); loadOrders(); }
+  else if (tab === 'inward')   { /* no auto-load; user must apply a filter */ }
+  else if (tab === 'summary')  loadSummary();
+  else if (tab === 'masters')  renderMastersLists();
+}
+
+/* --------- initial load --------- */
+async function loadAll() {
+  try {
+    state.masters = await callGS('api_getMasters');
+    populateDatalists();
+    // Set default dates to today
+    ['dash-date','outward-date','scan-view-date','phys-date','tally-date','compare-date','reorder-date','inw-rdate']
+      .forEach(id => { if ($(id) && !$(id).value) $(id).value = todayISO(); });
+    onTabShow(state.activeTab);
+  } catch (e) { toast('Load failed: ' + e.message, 'err'); }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  bindFileDrop('outward-file', 'outward-filename', handleOutwardFile);
+  bindFileDrop('tally-file',   'tally-filename',   handleTallyFile);
+  bindFileDrop('order-file',   'order-filename',   handleOrderFile);
+  bindFileDrop('inward-file',  'inward-filename',  handleInwardFile);
+  $('btn-upload-outward').addEventListener('click', uploadOutward);
+  $('btn-upload-tally').addEventListener('click', uploadTally);
+  $('btn-upload-order').addEventListener('click', uploadBulkOrder);
+  $('btn-upload-inward').addEventListener('click', uploadBulkInward);
+  $('btn-refresh').addEventListener('click', () => {
+    toast('Refreshing…', 'info');
+    loadAll();
+  });
+  loadAll();
+});
+
+/* --------- datalists (autocomplete) --------- */
+function populateDatalists() {
+  const skus = state.masters.skus || [];
+  $('dl-skus').innerHTML = skus.map(s =>
+    `<option value="${esc(s.SKU)}">${esc(s.Description || '')}</option>`).join('');
+  // Customer datalist is populated from Orders-sheet Col D (source of truth) — see loadSummary().
+  // Only fill it here as a fallback when the Order Summary hasn't been loaded yet.
+  const dl = $('dl-customers');
+  if (dl && !dl.innerHTML) {
+    const custs = state.masters.customers || [];
+    dl.innerHTML = custs.map(c => `<option value="${esc(c['Customer Name'])}">`).join('');
+  }
+  const dlBill = $('dl-billings');
+  if (dlBill) {
+    const custs = state.masters.customers || [];
+    dlBill.innerHTML = custs.map(c => `<option value="${esc(c['Billing Name'] || '')}">`).join('');
+  }
+  populateBrandFilteredSkus();
+}
+
+async function populateBrandFilteredSkus() {
+  const brand = ($('ord-brand') && $('ord-brand').value || '').trim();
+  const dl = $('dl-skus-brand');
+  if (!dl) return;
+  state.brandSkuDesc = {};
+  if (!brand) { dl.innerHTML = ''; return; }
+  try {
+    const rows = (await callGS('api_getBrandSkus', brand)) || [];
+    dl.innerHTML = rows.map(r =>
+      `<option value="${esc(r.sku)}">${esc(r.description || '')}</option>`).join('');
+    rows.forEach(r => { state.brandSkuDesc[String(r.sku).trim().toUpperCase()] = r.description || ''; });
+    if ($('oi-sku')) {
+      $('oi-sku').placeholder = rows.length
+        ? `Start typing SKU (${rows.length} available in ${brand})…`
+        : `No sheet named "${brand}" found — add a sheet with Code + Description columns.`;
+    }
+  } catch (e) {
+    console.error(e);
+    dl.innerHTML = '';
+  }
+}
+
+/* ============================================================
+ * DASHBOARD
+ * ============================================================ */
+async function loadDashboard() {
+  const d = $('dash-date').value || todayISO();
+  try {
+    const data = await callGS('api_getDashboard', d);
+    $('kpi-outward').textContent     = fmtNum(data.totalOutwardQty);
+    $('kpi-physical').textContent    = fmtNum(data.totalPhysical);
+    $('kpi-book').textContent        = fmtNum(data.totalBook);
+    $('kpi-outmismatch').textContent = fmtNum(data.outMismatchCount);
+    $('kpi-mismatch').textContent    = fmtNum(data.mismatchCount);
+    $('kpi-notord').textContent      = fmtNum(data.notOrderedReceipts);
+    // Show app version in the page subtitle so we can confirm the latest code is running
+    if (data.appVersion) {
+      const sub = $('page-sub');
+      if (sub && sub.textContent.indexOf('build ') < 0) sub.textContent += '  ·  build ' + data.appVersion;
+    }
+
+    $('tbl-outmismatch').querySelector('tbody').innerHTML = (data.outMismatchesTop || []).map(r => `
+      <tr class="${rowClass(r.status)}"><td class="mono">${esc(r.sku)}</td>
+      <td class="num">${fmtNum(r.scanned)}</td><td class="num">${fmtNum(r.bookOutward)}</td>
+      <td class="num">${fmtSigned(r.diff)}</td><td>${statusPill(r.status)}</td></tr>`).join('')
+      || emptyRow(5, 'No outward mismatches for this date.');
+
+    $('tbl-mismatch').querySelector('tbody').innerHTML = (data.mismatchesTop || []).map(r => `
+      <tr class="${rowClass(r.status)}"><td class="mono">${esc(r.sku)}</td>
+      <td class="num">${fmtNum(r.physical)}</td><td class="num">${fmtNum(r.bookQty)}</td>
+      <td class="num">${fmtSigned(r.diff)}</td><td>${statusPill(r.status)}</td></tr>`).join('')
+      || emptyRow(5, 'No stock mismatches for this date.');
+
+    $('tbl-reorder').querySelector('tbody').innerHTML = (data.reorderTop || []).map(r => `
+      <tr><td class="mono">${esc(r.sku)}</td>
+      <td class="num">${fmtNum(r.stock)}</td><td class="num">${fmtNum(r.inPipeline)}</td>
+      <td class="num">${fmtNum(r.msl)}</td>
+      <td class="num"><span class="pill hot">${fmtNum(r.suggested)}</span></td></tr>`).join('')
+      || emptyRow(5, 'No reorder suggestions.');
+
+    $('tbl-notord').querySelector('tbody').innerHTML = (data.notOrderedList || []).map(r => `
+      <tr><td class="muted">${esc(r.Date)}</td><td class="mono">${esc(r.SKU)}</td>
+      <td class="num">${fmtNum(r['Qty Received'])}</td></tr>`).join('')
+      || emptyRow(3, 'No un-ordered receipts.');
+  } catch (e) { toast('Dashboard error: ' + e.message, 'err'); }
+}
+function emptyRow(cols, msg) {
+  return `<tr><td colspan="${cols}" class="muted" style="padding:20px;text-align:center">${msg}</td></tr>`;
+}
+
+/* ============================================================
+ * FILE HELPERS
+ * ============================================================ */
+function bindFileDrop(inputId, labelId, handler) {
+  const inp = $(inputId);
+  const drop = inp.closest('.file-drop');
+  inp.addEventListener('change', e => {
+    if (e.target.files[0]) { $(labelId).textContent = e.target.files[0].name; handler(e.target.files[0]); }
+  });
+  drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('dragover'); });
+  drop.addEventListener('dragleave', () => drop.classList.remove('dragover'));
+  drop.addEventListener('drop', e => {
+    e.preventDefault(); drop.classList.remove('dragover');
+    if (e.dataTransfer.files[0]) {
+      inp.files = e.dataTransfer.files;
+      $(labelId).textContent = e.dataTransfer.files[0].name;
+      handler(e.dataTransfer.files[0]);
+    }
+  });
+}
+function readWorkbook(file) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = e => { try { resolve(XLSX.read(e.target.result, { type: 'array' })); } catch (err) { reject(err); } };
+    r.onerror = reject;
+    r.readAsArrayBuffer(file);
+  });
+}
+function sheetToAoA(ws) { return XLSX.utils.sheet_to_json(ws, { header: 1, defval: null, raw: true }); }
+function downloadXlsx(filename, data, sheetName) {
+  const ws = XLSX.utils.aoa_to_sheet(data);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, sheetName || 'Sheet1');
+  XLSX.writeFile(wb, filename);
+}
+
+/* ============================================================
+ * SCANNED UPLOAD
+ * ============================================================ */
+async function handleOutwardFile(file) {
+  try {
+    const wb = await readWorkbook(file);
+    let rows = null;
+    if (wb.SheetNames.includes('Pivot_Table')) {
+      const aoa = sheetToAoA(wb.Sheets['Pivot_Table']);
+      let headerRow = -1;
+      for (let i = 0; i < Math.min(aoa.length, 15); i++) {
+        const r = (aoa[i] || []).map(v => String(v || '').toLowerCase());
+        if (r.some(v => v.includes('row labels') || v === 'sku' || v.includes('code'))
+            && r.some(v => v.includes('total') || v.includes('qty') || v.includes('sum'))) { headerRow = i; break; }
+      }
+      if (headerRow >= 0) {
+        const hdr = aoa[headerRow].map(v => String(v || '').toLowerCase());
+        const skuCol = hdr.findIndex(v => v.includes('row labels') || v === 'sku' || v.includes('code'));
+        const qtyCol = hdr.findIndex(v => v.includes('total') || v.includes('qty') || v.includes('sum'));
+        rows = [];
+        for (let i = headerRow + 1; i < aoa.length; i++) {
+          const r = aoa[i] || [];
+          const sku = r[skuCol]; const qty = r[qtyCol];
+          if (sku && qty && !String(sku).toLowerCase().includes('grand total')) {
+            rows.push({ sku: String(sku).trim(), qty: Number(qty) || 0 });
+          }
+        }
+      }
+    }
+    if ((!rows || !rows.length) && wb.SheetNames.includes('Clean_data')) {
+      const aoa = sheetToAoA(wb.Sheets['Clean_data']);
+      const codeCol = (aoa[0] || []).findIndex(v => String(v || '').toLowerCase().includes('code'));
+      const map = new Map();
+      for (let i = 1; i < aoa.length; i++) {
+        const sku = aoa[i] && aoa[i][codeCol >= 0 ? codeCol : 1];
+        if (sku) map.set(String(sku).trim(), (map.get(String(sku).trim()) || 0) + 1);
+      }
+      rows = Array.from(map.entries()).map(([sku, qty]) => ({ sku, qty }));
+    }
+    if (!rows || !rows.length) {
+      const aoa = sheetToAoA(wb.Sheets[wb.SheetNames[0]]);
+      rows = [];
+      for (let i = 1; i < aoa.length; i++) {
+        const [a, b] = aoa[i] || [];
+        if (a && b) rows.push({ sku: String(a).trim(), qty: Number(b) || 0 });
+      }
+    }
+    state.outwardParsed = rows.filter(r => r.sku && r.qty !== 0);
+    $('outward-preview').textContent =
+      `Parsed ${state.outwardParsed.length} rows (source: ${wb.SheetNames.join(', ')})\n\n` +
+      state.outwardParsed.slice(0, 12).map(r => `${r.sku.padEnd(24)} ${r.qty}`).join('\n') +
+      (state.outwardParsed.length > 12 ? `\n… +${state.outwardParsed.length - 12} more` : '');
+    $('btn-upload-outward').disabled = !state.outwardParsed.length;
+  } catch (e) { toast('Parse error: ' + e.message, 'err'); }
+}
+
+async function uploadOutward() {
+  if (!state.outwardParsed || !state.outwardParsed.length) return;
+  const btn = $('btn-upload-outward');
+  btn.disabled = true; btn.textContent = 'Uploading…';
+  try {
+    const res = await callGS('api_uploadOutward', state.outwardParsed, $('outward-date').value);
+    toast(`Uploaded ${res.added} rows for ${res.date}.`, 'ok');
+    $('outward-preview').textContent = '';
+    $('outward-filename').textContent = 'No file selected';
+    state.outwardParsed = null;
+    $('scan-view-date').value = res.date;
+    // Refresh masters (may have new SKUs)
+    state.masters = await callGS('api_getMasters');
+    populateDatalists();
+    loadScannedForDate();
+    loadDashboard();
+  } catch (e) { toast('Upload failed: ' + e.message, 'err'); }
+  btn.textContent = 'Upload & Save'; btn.disabled = false;
+}
+
+async function loadScannedForDate() {
+  const d = $('scan-view-date').value || todayISO();
+  const rows = (await callGS('api_getScannedForDate', d)) || [];
+  state.outward = rows;
+  $('tbl-outward').querySelector('tbody').innerHTML = rows.map(r => `
+    <tr><td class="mono">${esc(r.sku)}</td><td>${esc(r.brand)}</td>
+    <td class="muted">${esc(r.description)}</td><td class="num">${fmtNum(r.qty)}</td></tr>
+  `).join('') || emptyRow(4, `No scanned data for ${d}.`);
+}
+
+async function clearOutwardByDate() {
+  const d = $('scan-view-date').value;
+  if (!d) return toast('Choose a date.', 'err');
+  if (!confirm(`Delete ALL scanned rows for ${d}?`)) return;
+  try {
+    const r = await callGS('api_clearOutwardByDate', d);
+    toast(`Deleted ${r.deleted} rows for ${d}.`, 'ok');
+    loadScannedForDate(); loadDashboard();
+  } catch (e) { toast('Failed: ' + e.message, 'err'); }
+}
+
+/* ============================================================
+ * PHYSICAL STOCK
+ * ============================================================ */
+async function renderPhysical() {
+  const d = $('phys-date').value || todayISO();
+  const rows = (await callGS('api_getPhysicalStockView', d)) || [];
+  state.physical = rows;
+  const tbody = $('tbl-physical').querySelector('tbody');
+  tbody.innerHTML = rows.map(r => `
+    <tr data-sku="${esc(r.sku)}" data-search="${esc((r.sku+' '+r.brand+' '+r.description).toLowerCase())}">
+      <td class="mono">${esc(r.sku)}</td>
+      <td>${esc(r.brand)}</td>
+      <td class="muted">${esc(r.description)}</td>
+      <td class="num">${fmtNum(r.qtySold)}</td>
+      <td><input type="number" min="0" class="phys-open" value="${r.inOpen || 0}" style="width:80px" onfocus="this.select()"></td>
+      <td><input type="number" min="0" class="phys-box"  value="${r.inBox || 0}"  style="width:80px" onfocus="this.select()"></td>
+      <td><input type="number" min="0" class="phys-disp" value="${r.inDisplay || 0}" style="width:80px" onfocus="this.select()"></td>
+      <td class="num mono phys-total">${fmtNum(r.total)}</td>
+      <td class="muted">${esc(r.updatedAt)}</td>
+    </tr>`).join('') || emptyRow(9, `Nothing to count for ${d}. Upload scanned outward first.`);
+  tbody.querySelectorAll('.phys-open, .phys-box, .phys-disp').forEach(inp => {
+    inp.addEventListener('input', e => {
+      const tr = e.target.closest('tr');
+      const o = Number(tr.querySelector('.phys-open').value) || 0;
+      const b = Number(tr.querySelector('.phys-box').value) || 0;
+      const d = Number(tr.querySelector('.phys-disp').value) || 0;
+      tr.querySelector('.phys-total').textContent = fmtNum(o + b + d);
+    });
+  });
+  filterPhysicalRows();
+}
+
+function filterPhysicalRows() {
+  const q = ($('phys-search').value || '').toLowerCase();
+  document.querySelectorAll('#tbl-physical tbody tr[data-sku]').forEach(tr => {
+    tr.style.display = (!q || tr.dataset.search.includes(q)) ? '' : 'none';
+  });
+}
+
+async function savePhysical() {
+  const d = $('phys-date').value || todayISO();
+  const entries = Array.from(document.querySelectorAll('#tbl-physical tbody tr[data-sku]'))
+    .map(tr => ({
+      sku: tr.dataset.sku,
+      inOpen: Number(tr.querySelector('.phys-open').value) || 0,
+      inBox: Number(tr.querySelector('.phys-box').value) || 0,
+      inDisplay: Number(tr.querySelector('.phys-disp').value) || 0,
+    }));
+  if (!entries.length) return;
+  try {
+    const r = await callGS('api_savePhysicalStock', d, entries);
+    toast(`Saved ${r.saved} rows for ${r.date}.`, 'ok');
+    renderPhysical(); loadDashboard();
+  } catch (e) { toast('Save failed: ' + e.message, 'err'); }
+}
+
+/* ============================================================
+ * BOOK STOCK (Tally) + COMPARISON
+ * ============================================================ */
+async function handleTallyFile(file) {
+  try {
+    const wb = await readWorkbook(file);
+    const aoa = sheetToAoA(wb.Sheets[wb.SheetNames[0]]);
+    let headerRow = -1;
+    for (let i = 0; i < Math.min(aoa.length, 8); i++) {
+      const r = (aoa[i] || []).map(v => String(v || '').toLowerCase());
+      if (r.some(v => v.includes('outward')) && r.some(v => v.includes('closing'))) { headerRow = i; break; }
+    }
+    let dataStart = headerRow >= 0 ? headerRow + 1 : 0;
+    if (headerRow >= 0) {
+      const next = (aoa[headerRow + 1] || []).map(v => String(v || '').toLowerCase());
+      if (next.some(v => v.includes('quantity') || v.includes('qty'))) dataStart = headerRow + 2;
+    }
+    const rows = [];
+    for (let i = dataStart; i < aoa.length; i++) {
+      const r = aoa[i] || [];
+      const raw = r[0];
+      if (!raw) continue;
+      const rawStr = String(raw).replace(/_x000D_/g, '').replace(/\s+/g, ' ').trim();
+      if (!rawStr) continue;
+      if (/^(sku|code|item|particulars|closing|outward)/i.test(rawStr)) continue;
+      const outwardQty = (r[1] === '' || r[1] == null) ? '' : Number(r[1]);
+      const closing    = (r[2] === '' || r[2] == null) ? '' : Number(r[2]);
+      if (outwardQty === '' && closing === '') continue;
+      rows.push({ raw: rawStr, outwardQty, closing });
+    }
+    state.tallyParsed = rows;
+    $('tally-preview').textContent =
+      `Parsed ${rows.length} rows (header row: ${headerRow >= 0 ? headerRow + 1 : 'n/a'})\n\n` +
+      'SKU'.padEnd(22) + ' OUT   CLOSE   RAW\n' +
+      rows.slice(0, 10).map(r => {
+        const sku = r.raw.split(/\s+/)[0];
+        return `${sku.padEnd(22)} ${String(r.outwardQty).padStart(4)}  ${String(r.closing).padStart(5)}   ${r.raw.slice(0,50)}`;
+      }).join('\n') +
+      (rows.length > 10 ? `\n… +${rows.length - 10} more` : '');
+    $('btn-upload-tally').disabled = !rows.length;
+  } catch (e) { toast('Parse error: ' + e.message, 'err'); }
+}
+
+async function uploadTally() {
+  if (!state.tallyParsed || !state.tallyParsed.length) return;
+  const btn = $('btn-upload-tally');
+  btn.disabled = true; btn.textContent = 'Uploading…';
+  const d = $('tally-date').value || todayISO();
+  try {
+    const r = await callGS('api_uploadBookStock', state.tallyParsed, d);
+    toast(`Book stock: ${r.count} SKUs saved for ${r.date}.`, 'ok');
+    $('tally-preview').textContent = '';
+    $('tally-filename').textContent = 'No file selected';
+    state.tallyParsed = null;
+    $('compare-date').value = r.date;
+    loadComparison(); loadDashboard();
+  } catch (e) { toast('Upload failed: ' + e.message, 'err'); }
+  btn.textContent = 'Upload Book Stock'; btn.disabled = false;
+}
+
+async function loadComparison() {
+  const d = $('compare-date').value || todayISO();
+  const [cmp, outCmp] = await Promise.all([
+    callGS('api_getComparison', d),
+    callGS('api_getOutwardComparison', d),
+  ]);
+  state.compare = cmp || [];
+  state.outCompare = outCmp || [];
+  renderCompare(); renderOutwardCompare();
+}
+/* Mismatch-reason dropdown options (used by both comparison tables) */
+const REASON_OPTIONS = [
+  'Purchase pending',
+  'Sale bill pending',
+  'Scanned, dispatch pending',
+  'Bills made dispatch pending',
+];
+
+function reasonCell(type, sku, currentReason, status) {
+  if (status === 'MATCH') return '<span class="muted">—</span>';
+  const opts = ['<option value="">— select —</option>']
+    .concat(REASON_OPTIONS.map(r => `<option${r === currentReason ? ' selected' : ''}>${esc(r)}</option>`))
+    .join('');
+  return `<select class="reason-sel" data-type="${type}" data-sku="${esc(sku)}" onchange="saveReason(this)">${opts}</select>`;
+}
+
+async function saveReason(sel) {
+  const d = $('compare-date').value || todayISO();
+  const type = sel.dataset.type;
+  const sku = sel.dataset.sku;
+  try {
+    await callGS('api_setMismatchReason', d, type, sku, sel.value);
+    sel.style.borderColor = 'var(--ok)';
+    setTimeout(() => sel.style.borderColor = '', 800);
+  } catch (e) {
+    toast('Failed to save reason: ' + e.message, 'err');
+    sel.style.borderColor = 'var(--hot)';
+  }
+}
+
+function renderCompare() {
+  const f = $('cmp-filter').value;
+  const rows = f ? state.compare.filter(r => r.status === f) : state.compare;
+  $('tbl-compare').querySelector('tbody').innerHTML = rows.map(r => `
+    <tr class="${rowClass(r.status)}">
+      <td class="mono">${esc(r.sku)}</td>
+      <td>${esc(r.brand)}</td>
+      <td class="muted">${esc(r.description)}</td>
+      <td class="num">${fmtNum(r.physical)}</td>
+      <td class="num">${r.closingBlank ? '<span class="muted">—</span>' : fmtNum(r.bookQty)}</td>
+      <td class="num"><b>${fmtSigned(r.diff)}</b></td>
+      <td>${statusPill(r.status)}</td>
+      <td>${reasonCell('stock', r.sku, r.reason, r.status)}</td>
+    </tr>`).join('') || emptyRow(8, 'No comparison data for this date.');
+}
+function renderOutwardCompare() {
+  const f = $('outcmp-filter').value;
+  const rows = f ? state.outCompare.filter(r => r.status === f) : state.outCompare;
+  $('tbl-outcompare').querySelector('tbody').innerHTML = rows.map(r => `
+    <tr class="${rowClass(r.status)}">
+      <td class="mono">${esc(r.sku)}</td>
+      <td>${esc(r.brand)}</td>
+      <td class="muted">${esc(r.description)}</td>
+      <td class="num">${fmtNum(r.scanned)}</td>
+      <td class="num">${fmtNum(r.bookOutward)}</td>
+      <td class="num"><b>${fmtSigned(r.diff)}</b></td>
+      <td>${statusPill(r.status)}</td>
+      <td>${reasonCell('outward', r.sku, r.reason, r.status)}</td>
+    </tr>`).join('') || emptyRow(8, 'No outward comparison data for this date.');
+}
+
+/* ============================================================
+ * MSL & Reorder
+ * ============================================================ */
+async function calcMSL(applyToSheet) {
+  try {
+    const win = Number($('msl-window').value);
+    const buf = Number($('msl-buffer').value);
+    const r = await callGS('api_calcMSL', win, buf, !!applyToSheet);
+    state.mslRows = r.rows || [];
+    if (applyToSheet) {
+      toast(`MSL updated for ${state.mslRows.length} SKUs.`, 'ok');
+      state.masters = await callGS('api_getMasters');
+      populateDatalists();
+    }
+    const tbody = $('tbl-msl').querySelector('tbody');
+    tbody.innerHTML = state.mslRows.map(r => `
+      <tr data-sku="${esc(r.sku)}">
+        <td class="mono">${esc(r.sku)}</td>
+        <td>${esc(r.brand)}</td>
+        <td class="muted">${esc(r.description)}</td>
+        <td class="num">${fmtNum(r.totalSales)}</td>
+        <td class="num">${r.avgDaily}</td>
+        <td><input type="number" min="0" class="msl-inp" value="${r.currentMsl}" style="width:90px" onfocus="this.select()"></td>
+        <td class="num"><span class="pill info">${fmtNum(r.suggested)}</span></td>
+      </tr>`).join('') || emptyRow(7, 'No sales data or SKUs.');
+    tbody.querySelectorAll('.msl-inp').forEach(inp => {
+      inp.addEventListener('change', async e => {
+        const tr = e.target.closest('tr');
+        try {
+          await callGS('api_setMSL', tr.dataset.sku, Number(e.target.value) || 0);
+          toast(`${tr.dataset.sku} MSL updated.`, 'ok');
+        } catch (err) { toast('Failed: ' + err.message, 'err'); }
+      });
+    });
+  } catch (e) { toast('MSL calc failed: ' + e.message, 'err'); }
+}
+
+async function loadReorder() {
+  const d = $('reorder-date').value || todayISO();
+  const rows = (await callGS('api_getReorderSuggestions', d)) || [];
+  state.reorder = rows;
+  $('tbl-reorder-full').querySelector('tbody').innerHTML = rows.map(r => `
+    <tr class="${r.reorder ? 'diff-miss' : ''}">
+      <td class="mono">${esc(r.sku)}</td>
+      <td>${esc(r.brand)}</td>
+      <td class="num">${fmtNum(r.stock)}</td>
+      <td class="num">${fmtNum(r.inPipeline)}</td>
+      <td class="num">${fmtNum(r.msl)}</td>
+      <td class="num">${r.reorder ? `<span class="pill hot">${fmtNum(r.suggested)}</span>` : `<span class="muted">0</span>`}</td>
+    </tr>`).join('') || emptyRow(6, 'No SKUs yet.');
+}
+
+/* ============================================================
+ * PURCHASE ORDERS
+ * ============================================================ */
+function renderOrderForm() {
+  const brandOpts = ['<option value="">— Select —</option>'].concat((state.masters.brands || []).map(b => `<option>${esc(b)}</option>`)).join('');
+  const otypeOpts = ['<option value="">— Select —</option>'].concat((state.masters.orderTypes || []).map(b => `<option>${esc(b)}</option>`)).join('');
+  $('ord-of').innerHTML = otypeOpts;
+  $('ord-brand').innerHTML = brandOpts;
+  $('bord-of').innerHTML = otypeOpts;
+  $('bord-brand').innerHTML = brandOpts;
+  $('sum-orderof').innerHTML = ['<option value="">All</option>'].concat((state.masters.orderTypes || []).map(o => `<option>${esc(o)}</option>`)).join('');
+
+  const brandSel = $('ord-brand');
+  if (brandSel && !brandSel._wired) {
+    brandSel._wired = true;
+    brandSel.addEventListener('change', () => {
+      populateBrandFilteredSkus();
+      // Clear the SKU input so user starts fresh under the new brand
+      if ($('oi-sku')) $('oi-sku').value = '';
+    });
+  }
+  populateBrandFilteredSkus();
+
+  const oi = $('oi-sku'); const qty = $('oi-qty');
+  if (oi && !oi._wired) {
+    oi._wired = true;
+    oi.addEventListener('keydown', e => {
+      if (e.key === 'Enter') { e.preventDefault(); qty.focus(); qty.select(); }
+    });
+  }
+  if (qty && !qty._wired) {
+    qty._wired = true;
+    qty.addEventListener('keydown', e => {
+      if (e.key === 'Enter') { e.preventDefault(); addPendingItem(); }
+    });
+  }
+  renderPendingItems();
+}
+
+function addPendingItem() {
+  const skuIn = $('oi-sku'); const qtyIn = $('oi-qty');
+  const sku = String(skuIn.value || '').trim().toUpperCase();
+  const qty = Number(qtyIn.value) || 0;
+  if (!sku) { skuIn.focus(); return toast('Enter SKU first.', 'err'); }
+  if (qty <= 0) { qtyIn.focus(); qtyIn.select(); return toast('Enter qty > 0.', 'err'); }
+  const desc = (state.brandSkuDesc && state.brandSkuDesc[sku]) || '';
+  const existing = state.pendingItems.find(x => x.sku === sku);
+  if (existing) { existing.qty += qty; if (!existing.description && desc) existing.description = desc; }
+  else state.pendingItems.push({ sku, qty, description: desc });
+  skuIn.value = ''; qtyIn.value = 1;
+  renderPendingItems();
+  skuIn.focus();
+}
+
+function renderPendingItems() {
+  const tbody = $('tbl-pending') && $('tbl-pending').querySelector('tbody');
+  if (!tbody) return;
+  $('oi-count').textContent = `(${state.pendingItems.length})`;
+  tbody.innerHTML = state.pendingItems.length ? state.pendingItems.map((it, i) => `
+    <tr>
+      <td class="muted">${i + 1}</td>
+      <td class="mono">${esc(it.sku)}</td>
+      <td><input type="number" min="1" value="${it.qty}" class="pi-qty" data-idx="${i}" style="width:80px" onfocus="this.select()"></td>
+      <td class="muted" style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(it.description || '')}">${esc(it.description || '')}</td>
+      <td><button class="btn danger tiny" onclick="deletePendingItem(${i})">×</button></td>
+    </tr>`).join('') : `<tr><td colspan="5" class="muted" style="padding:14px;text-align:center">No items yet.</td></tr>`;
+  tbody.querySelectorAll('.pi-qty').forEach(inp => {
+    inp.addEventListener('input', e => {
+      state.pendingItems[Number(e.target.dataset.idx)].qty = Number(e.target.value) || 0;
+    });
+  });
+}
+function deletePendingItem(i) { state.pendingItems.splice(i, 1); renderPendingItems(); }
+function clearPendingItems() {
+  if (!state.pendingItems.length) return;
+  if (!confirm('Clear all pending items?')) return;
+  state.pendingItems = []; renderPendingItems();
+}
+
+async function placeOrder() {
+  const items = state.pendingItems.filter(x => x.sku && x.qty > 0);
+  if (!items.length) return toast('Add at least one item.', 'err');
+  const brand = $('ord-brand').value;
+  const payload = {
+    orderOf: $('ord-of').value,
+    customerName: $('ord-cust').value,
+    billingName: $('ord-bill').value,
+    items: items.map(i => ({ sku: i.sku, qty: i.qty, brand, description: i.description || '' })),
+  };
+  try {
+    const r = await callGS('api_placeOrder', payload);
+    toast(`Order ${r.orderId} placed (${r.count} lines). Downloading…`, 'ok');
+    downloadXlsx(`${r.orderId}.xlsx`, items.map(i => [i.sku, i.qty]), 'Order');
+    state.pendingItems = []; renderPendingItems();
+    $('ord-cust').value = ''; $('ord-bill').value = '';
+    state.masters = await callGS('api_getMasters');
+    populateDatalists();
+    loadOrders(); loadDashboard();
+  } catch (e) { toast('Failed: ' + e.message, 'err'); }
+}
+
+async function handleOrderFile(file) {
+  try {
+    const wb = await readWorkbook(file);
+    const aoa = sheetToAoA(wb.Sheets[wb.SheetNames[0]]);
+    const rows = [];
+    for (let i = 0; i < aoa.length; i++) {
+      const r = aoa[i] || [];
+      const [a, b, c] = [r[0], r[1], r[2]];
+      if (!a || b == null) continue;
+      const sku = String(a).trim();
+      const qty = Number(b);
+      if (isNaN(qty) || qty <= 0) continue;
+      if (/^(sku|code|product)/i.test(sku)) continue;
+      const desc = c == null ? '' : String(c).trim();
+      rows.push({ sku, qty, description: desc });
+    }
+    state.orderParsed = rows;
+    $('order-preview').textContent = `Parsed ${rows.length} rows.\n\n` +
+      rows.slice(0, 12).map(r => `${r.sku.padEnd(20)} ${String(r.qty).padStart(4)}  ${(r.description || '').slice(0,40)}`).join('\n');
+    $('btn-upload-order').disabled = !rows.length;
+  } catch (e) { toast('Parse error: ' + e.message, 'err'); }
+}
+
+async function uploadBulkOrder() {
+  if (!state.orderParsed || !state.orderParsed.length) return;
+  const brand = $('bord-brand').value;
+  try {
+    const r = await callGS('api_placeOrder', {
+      orderOf: $('bord-of').value,
+      customerName: $('bord-cust').value,
+      billingName: $('bord-bill').value,
+      items: state.orderParsed.map(x => ({ sku: x.sku, qty: x.qty, brand, description: x.description || '' })),
+    });
+    toast(`Bulk order ${r.orderId} placed (${r.count} lines). Downloading…`, 'ok');
+    downloadXlsx(`${r.orderId}.xlsx`, state.orderParsed.map(x => [x.sku, x.qty]), 'Order');
+    $('order-preview').textContent = ''; $('order-filename').textContent = 'No file selected';
+    state.orderParsed = null; $('btn-upload-order').disabled = true;
+    state.masters = await callGS('api_getMasters');
+    populateDatalists();
+    loadOrders(); loadDashboard();
+  } catch (e) { toast('Failed: ' + e.message, 'err'); }
+}
+
+async function loadOrders() {
+  const filters = {
+    dateFrom: $('ord-from').value,
+    dateTo:   $('ord-to').value,
+    status:   $('ord-status').value,
+    customer: $('ord-filter-cust').value,
+  };
+  state.orders = (await callGS('api_getOrders', filters)) || [];
+  renderOrders();
+}
+function renderOrders() {
+  $('tbl-orders').querySelector('tbody').innerHTML = state.orders.map(r => `
+    <tr>
+      <td class="mono">${esc(r['Order ID'])}</td>
+      <td class="muted">${esc(r.Date)}</td>
+      <td>${esc(r['Order Of'])}</td>
+      <td>${esc(r['Customer Name'])}</td>
+      <td>${esc(r['Billing Name'])}</td>
+      <td>${esc(r.Brand)}</td>
+      <td class="mono">${esc(r.SKU)}</td>
+      <td class="num">${fmtNum(r['Qty Ordered'])}</td>
+      <td class="num">${fmtNum(r['Qty Received'])}</td>
+      <td>${statusPill(r.Status || 'Pending')}</td>
+    </tr>`).join('') || emptyRow(10, 'No orders match the filters.');
+}
+
+/* ============================================================
+ * RECEIVED MATERIAL
+ * ============================================================ */
+async function loadOpenOrderLines() {
+  const from = $('inw-from').value;
+  const to   = $('inw-to').value;
+  const cust = $('inw-cust').value.trim();
+  const sku  = $('inw-sku').value.trim();
+  if (!from && !to && !cust && !sku) {
+    $('inw-empty').classList.remove('hidden');
+    $('inw-table-wrap').classList.add('hidden');
+    return toast('Set at least one filter (date, customer, or SKU).', 'warn');
+  }
+  const filters = { dateFrom: from, dateTo: to, customer: cust, sku: sku };
+  const rows = (await callGS('api_getOpenOrderLines', filters)) || [];
+  $('inw-empty').classList.add('hidden');
+  $('inw-table-wrap').classList.remove('hidden');
+  const rDefault = $('inw-rdate').value || todayISO();
+  $('tbl-inward').querySelector('tbody').innerHTML = rows.map(r => `
+    <tr data-order="${esc(r.orderId)}" data-sku="${esc(r.sku)}">
+      <td class="mono">${esc(r.orderId)}</td>
+      <td class="muted">${esc(r.date)}</td>
+      <td class="mono">${esc(r.sku)}</td>
+      <td>${esc(r.brand)}</td>
+      <td>${esc(r.customer)}</td>
+      <td class="num">${fmtNum(r.ordered)}</td>
+      <td class="num">${fmtNum(r.received)}</td>
+      <td class="num"><b>${fmtNum(r.pending)}</b></td>
+      <td><input type="number" min="0" max="${r.pending}" value="${r.pending}" class="inw-qty" style="width:80px" onfocus="this.select()"></td>
+      <td><input type="date" class="inw-rdate" value="${rDefault}"></td>
+      <td><button class="btn tiny primary" onclick="receiveInward(this)">Receive</button></td>
+    </tr>`).join('') || emptyRow(11, 'No open order lines match the filters.');
+}
+
+function clearInwardFilters() {
+  ['inw-from','inw-to','inw-cust','inw-sku'].forEach(id => $(id).value = '');
+  $('inw-empty').classList.remove('hidden');
+  $('inw-table-wrap').classList.add('hidden');
+}
+
+async function receiveInward(btn) {
+  const tr = btn.closest('tr');
+  const qty = Number(tr.querySelector('.inw-qty').value) || 0;
+  const rdate = tr.querySelector('.inw-rdate').value || todayISO();
+  if (qty <= 0) return toast('Enter qty > 0', 'err');
+  try {
+    const r = await callGS('api_receiveInward', tr.dataset.order, tr.dataset.sku, qty, rdate);
+    toast(`${r.sku}: ${r.newRec} received (${r.status}).`, 'ok');
+    loadOpenOrderLines(); loadOrders(); loadDashboard();
+  } catch (e) { toast('Failed: ' + e.message, 'err'); }
+}
+
+async function handleInwardFile(file) {
+  try {
+    const wb = await readWorkbook(file);
+    const aoa = sheetToAoA(wb.Sheets[wb.SheetNames[0]]);
+    const rows = [];
+    for (let i = 0; i < aoa.length; i++) {
+      const r = aoa[i] || [];
+      const [a, b] = [r[0], r[1]];
+      if (!a || b == null) continue;
+      const sku = String(a).trim(); const qty = Number(b);
+      if (isNaN(qty) || qty <= 0) continue;
+      if (/^(sku|code|product)/i.test(sku)) continue;
+      rows.push({ sku, qty });
+    }
+    state.inwardParsed = rows;
+    $('inward-preview').textContent = `Parsed ${rows.length} rows.\n\n` +
+      rows.slice(0, 12).map(r => `${r.sku.padEnd(24)} ${r.qty}`).join('\n');
+    $('btn-upload-inward').disabled = !rows.length;
+  } catch (e) { toast('Parse error: ' + e.message, 'err'); }
+}
+
+async function uploadBulkInward() {
+  if (!state.inwardParsed || !state.inwardParsed.length) return;
+  const d = $('inw-rdate').value || todayISO();
+  try {
+    const results = await callGS('api_bulkInward', state.inwardParsed, d);
+    const ok = results.filter(r => r.orderId).length;
+    const na = results.filter(r => !r.orderId);
+    toast(`${ok} allocated. ${na.length} un-ordered.`, na.length ? 'warn' : 'ok');
+    $('inward-preview').textContent += '\n\nResult:\n' + results.map(r =>
+      r.orderId ? `${r.sku}: ${r.taken} → ${r.orderId} (${r.status})` : `${r.sku}: NOT ORDERED (${r.leftover})`
+    ).join('\n');
+    state.inwardParsed = null; $('btn-upload-inward').disabled = true;
+    // Reload open lines only if a filter is currently set
+    if ($('inw-from').value || $('inw-to').value || $('inw-cust').value || $('inw-sku').value) {
+      loadOpenOrderLines();
+    }
+    loadOrders(); loadDashboard();
+  } catch (e) { toast('Failed: ' + e.message, 'err'); }
+}
+
+/* ============================================================
+ * ORDER SUMMARY
+ * ============================================================ */
+function clearSummaryFilters() {
+  ['sum-customer','sum-orderof','sum-status','sum-from','sum-to'].forEach(id => $(id).value = '');
+  loadSummary();
+}
+async function loadSummary() {
+  const filters = {
+    customer: $('sum-customer').value,
+    orderOf:  $('sum-orderof').value,
+    status:   $('sum-status').value,
+    dateFrom: $('sum-from').value,
+    dateTo:   $('sum-to').value,
+  };
+  const res = (await callGS('api_getOrderSummary', filters)) || { rows: [], byCustomer: [], customers: [] };
+  state.lastSummary = res;
+
+  // Populate customer datalist ONLY from actual Orders-sheet names (source of truth)
+  if ($('dl-customers')) {
+    $('dl-customers').innerHTML = (res.customers || []).map(c => `<option value="${esc(c)}">`).join('');
+  }
+
+  const tbody = $('tbl-summary-cust').querySelector('tbody');
+  tbody.innerHTML = res.byCustomer.map((g, i) => `
+    <tr class="cust-row" data-idx="${i}" style="cursor:pointer">
+      <td><span class="chev">▸</span></td>
+      <td><b>${esc(g.customer)}</b></td>
+      <td class="num">${fmtNum(g.orderIds.length)}</td>
+      <td class="num">${fmtNum(g.lines.length)}</td>
+      <td class="num">${fmtNum(g.totalOrdered)}</td>
+      <td class="num">${fmtNum(g.totalReceived)}</td>
+      <td class="num"><b>${fmtNum(g.totalPending)}</b></td>
+    </tr>
+    <tr class="cust-detail" data-idx="${i}" style="display:none">
+      <td></td>
+      <td colspan="6">
+        <table style="width:100%">
+          <thead><tr><th>Order ID</th><th>Date</th><th>Order Of</th><th>Brand</th><th>SKU</th><th>Ordered</th><th>Received</th><th>Pending</th><th>Status</th></tr></thead>
+          <tbody>
+            ${g.lines.map(l => `<tr>
+              <td class="mono">${esc(l.orderId)}</td>
+              <td class="muted">${esc(l.date)}</td>
+              <td>${esc(l.orderOf)}</td>
+              <td>${esc(l.brand)}</td>
+              <td class="mono">${esc(l.sku)}</td>
+              <td class="num">${fmtNum(l.ordered)}</td>
+              <td class="num">${fmtNum(l.received)}</td>
+              <td class="num"><b>${fmtNum(l.pending)}</b></td>
+              <td>${statusPill(l.status || 'Pending')}</td>
+            </tr>`).join('')}
+          </tbody>
+        </table>
+      </td>
+    </tr>`).join('') || emptyRow(7, 'No customers match. Place an order first, or clear filters.');
+
+  tbody.querySelectorAll('.cust-row').forEach(tr => {
+    tr.addEventListener('click', () => {
+      const idx = tr.dataset.idx;
+      const det = tbody.querySelector(`.cust-detail[data-idx="${idx}"]`);
+      const open = det.style.display !== 'none';
+      det.style.display = open ? 'none' : 'table-row';
+      tr.querySelector('.chev').textContent = open ? '▸' : '▾';
+    });
+  });
+}
+
+function downloadSummary() {
+  const res = state.lastSummary;
+  if (!res || !res.byCustomer || !res.byCustomer.length) return toast('No data. Apply filters first.', 'err');
+  const wb = XLSX.utils.book_new();
+  // By Customer sheet
+  const cHeader = ['Customer', 'Orders', 'Lines', 'Total Ordered', 'Total Received', 'Total Pending'];
+  const cData = [cHeader].concat(res.byCustomer.map(g => [
+    g.customer, g.orderIds.length, g.lines.length, g.totalOrdered, g.totalReceived, g.totalPending
+  ]));
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(cData), 'By Customer');
+  // All lines sheet
+  const lHeader = ['Customer', 'Order ID', 'Date', 'Order Of', 'Brand', 'SKU', 'Ordered', 'Received', 'Pending', 'Status'];
+  const lData = [lHeader];
+  res.byCustomer.forEach(g => g.lines.forEach(l => lData.push([
+    g.customer, l.orderId, l.date, l.orderOf, l.brand, l.sku, l.ordered, l.received, l.pending, l.status
+  ])));
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(lData), 'Order Lines');
+  const filename = `OrderSummary-${todayISO()}.xlsx`;
+  XLSX.writeFile(wb, filename);
+  toast(`Downloaded ${filename}`, 'ok');
+}
+
+/* ============================================================
+ * MASTERS
+ * ============================================================ */
+function renderMastersLists() {
+  const brandOpts = ['<option value="">— Select —</option>'].concat((state.masters.brands || []).map(b => `<option>${esc(b)}</option>`)).join('');
+  $('m-brand').innerHTML = brandOpts;
+  $('list-brands').innerHTML   = (state.masters.brands || []).map(b => `<li>${esc(b)}</li>`).join('');
+  $('list-otypes').innerHTML   = (state.masters.orderTypes || []).map(b => `<li>${esc(b)}</li>`).join('');
+  $('list-customers').innerHTML = (state.masters.customers || []).map(c =>
+    `<li>${esc(c['Customer Name'])}${c['Billing Name'] ? ' → ' + esc(c['Billing Name']) : ''}</li>`).join('');
+  onMasterSkuPick();
+}
+
+function onMasterSkuPick() {
+  const val = String($('m-sku-pick').value || '').trim().toUpperCase();
+  if (!val) {
+    $('m-details').classList.add('hidden');
+    $('m-empty').classList.remove('hidden');
+    return;
+  }
+  const s = (state.masters.skus || []).find(x => String(x.SKU).toUpperCase() === val);
+  if (s) {
+    $('m-empty').classList.add('hidden');
+    $('m-details').classList.remove('hidden');
+    $('m-sku').value = s.SKU;
+    $('m-sku').disabled = true;
+    $('m-brand').value = s.Brand || '';
+    $('m-desc').value = s.Description || '';
+    $('m-msl').value = Number(s.MSL) || 0;
+  } else {
+    $('m-details').classList.add('hidden');
+    $('m-empty').classList.remove('hidden');
+    $('m-empty').innerHTML = `SKU <b>${esc(val)}</b> not found. Click <b>+ Add SKU</b> to create it.`;
+  }
+}
+
+function showAddSkuForm() {
+  $('m-empty').classList.add('hidden');
+  $('m-details').classList.remove('hidden');
+  $('m-sku').value = ''; $('m-sku').disabled = false;
+  $('m-brand').value = ''; $('m-desc').value = ''; $('m-msl').value = 0;
+  $('m-sku').focus();
+}
+
+async function saveSku() {
+  const sku = $('m-sku').value.trim();
+  if (!sku) return toast('SKU required', 'err');
+  try {
+    state.masters = await callGS('api_upsertSku', sku, $('m-brand').value, $('m-desc').value, $('m-msl').value);
+    populateDatalists();
+    toast('Saved.', 'ok');
+    $('m-sku-pick').value = sku.toUpperCase();
+    onMasterSkuPick();
+  } catch (e) { toast('Failed: ' + e.message, 'err'); }
+}
+async function deleteSkuCurrent() {
+  const sku = $('m-sku').value.trim();
+  if (!sku || !confirm('Delete ' + sku + '?')) return;
+  state.masters = await callGS('api_deleteSku', sku);
+  populateDatalists();
+  $('m-sku-pick').value = '';
+  onMasterSkuPick();
+}
+async function addBrand() {
+  const val = ($('brand-new') && $('brand-new').value.trim()) || ($('ord-brand-new') && $('ord-brand-new').value.trim());
+  if (!val) return;
+  state.masters = await callGS('api_addBrand', val);
+  populateDatalists();
+  if ($('brand-new')) $('brand-new').value = '';
+  if ($('ord-brand-new')) $('ord-brand-new').value = '';
+  renderMastersLists(); renderOrderForm();
+  toast('Brand added.', 'ok');
+}
+async function addOrderType() {
+  const val = ($('otype-new') && $('otype-new').value.trim()) || ($('ord-of-new') && $('ord-of-new').value.trim());
+  if (!val) return;
+  state.masters = await callGS('api_addOrderType', val);
+  if ($('otype-new')) $('otype-new').value = '';
+  if ($('ord-of-new')) $('ord-of-new').value = '';
+  renderMastersLists(); renderOrderForm();
+  toast('Order type added.', 'ok');
+}
+async function addCustomerMaster() {
+  const name = $('cust-new').value.trim();
+  const bill = $('cust-bill-new').value.trim();
+  if (!name) return;
+  state.masters = await callGS('api_addCustomer', name, bill);
+  populateDatalists();
+  $('cust-new').value = ''; $('cust-bill-new').value = '';
+  renderMastersLists();
+  toast('Customer added.', 'ok');
+}
+</script>

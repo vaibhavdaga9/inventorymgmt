@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <meta charset="utf-8">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;700&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <?!= include('Stylesheet') ?>
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">◧</div>
+        <div>
+          <div class="brand-title">STOCKLEDGER</div>
+          <div class="brand-sub">Inventory Ops</div>
+        </div>
+      </div>
+      <nav id="nav">
+        <button class="nav-btn active" data-tab="dashboard">Dashboard</button>
+        <button class="nav-btn" data-tab="outward">Scanned Upload</button>
+        <button class="nav-btn" data-tab="physical">Physical Stock</button>
+        <button class="nav-btn" data-tab="compare">Stock Comparison</button>
+        <button class="nav-btn" data-tab="msl">MSL &amp; Reorder</button>
+        <button class="nav-btn" data-tab="orders">Purchase Orders</button>
+        <button class="nav-btn" data-tab="inward">Received Material</button>
+        <button class="nav-btn" data-tab="summary">Order Summary</button>
+        <button class="nav-btn" data-tab="masters">Masters</button>
+      </nav>
+      <div class="sidebar-footer">
+        <div class="dot"></div>
+        <span>Connected to Google Sheet</span>
+      </div>
+    </aside>
+
+    <main class="content">
+      <header class="topbar">
+        <div>
+          <h1 id="page-title">Dashboard</h1>
+          <p id="page-sub" class="muted">Live snapshot of stock, mismatches and orders.</p>
+        </div>
+        <div class="topbar-actions">
+          <button class="btn ghost" id="btn-refresh">↻ Refresh</button>
+        </div>
+      </header>
+
+      <!-- Shared SKU datalist for autocomplete dropdowns -->
+      <datalist id="dl-skus"></datalist>
+      <datalist id="dl-skus-brand"></datalist>
+      <datalist id="dl-customers"></datalist>
+      <datalist id="dl-billings"></datalist>
+
+      <!-- ============ DASHBOARD ============ -->
+      <section id="tab-dashboard" class="tab active">
+        <div class="card compact">
+          <div class="filter-bar">
+            <div><label>Date</label><input type="date" id="dash-date"></div>
+            <button class="btn primary" onclick="loadDashboard()">Apply</button>
+          </div>
+        </div>
+        <div class="kpi-grid">
+          <div class="kpi"><div class="kpi-label">Scanned Outward</div><div class="kpi-value" id="kpi-outward">—</div></div>
+          <div class="kpi"><div class="kpi-label">Physical Stock</div><div class="kpi-value" id="kpi-physical">—</div></div>
+          <div class="kpi"><div class="kpi-label">Closing Balance</div><div class="kpi-value" id="kpi-book">—</div></div>
+          <div class="kpi warn"><div class="kpi-label">Outward Mismatches</div><div class="kpi-value" id="kpi-outmismatch">—</div></div>
+          <div class="kpi warn"><div class="kpi-label">Stock Mismatches</div><div class="kpi-value" id="kpi-mismatch">—</div></div>
+          <div class="kpi hot"><div class="kpi-label">Not Ordered Receipts</div><div class="kpi-value" id="kpi-notord">—</div></div>
+        </div>
+        <div class="two-col">
+          <div class="card">
+            <div class="card-head"><h3>Outward vs Book Outward</h3></div>
+            <div class="scroll"><table id="tbl-outmismatch"><thead><tr><th>SKU</th><th>Scanned</th><th>Book</th><th>Diff</th><th>Status</th></tr></thead><tbody></tbody></table></div>
+          </div>
+          <div class="card">
+            <div class="card-head"><h3>Physical vs Closing</h3></div>
+            <div class="scroll"><table id="tbl-mismatch"><thead><tr><th>SKU</th><th>Physical</th><th>Closing</th><th>Diff</th><th>Status</th></tr></thead><tbody></tbody></table></div>
+          </div>
+        </div>
+        <div class="two-col">
+          <div class="card">
+            <div class="card-head"><h3>Suggested Reorders</h3></div>
+            <div class="scroll"><table id="tbl-reorder"><thead><tr><th>SKU</th><th>Stock</th><th>Pipeline</th><th>MSL</th><th>Suggested</th></tr></thead><tbody></tbody></table></div>
+          </div>
+          <div class="card">
+            <div class="card-head"><h3>Received but Not Ordered</h3><span class="muted">Material received without a matching PO.</span></div>
+            <div class="scroll"><table id="tbl-notord"><thead><tr><th>Date</th><th>SKU</th><th>Qty</th></tr></thead><tbody></tbody></table></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ SCANNED UPLOAD ============ -->
+      <section id="tab-outward" class="tab">
+        <div class="card">
+          <div class="card-head"><h3>Upload Scanned Outward</h3>
+            <span class="muted">Reads <b>Pivot_Table</b> sheet · Same-date uploads accumulate · Multiple sheets per date supported.</span>
+          </div>
+          <div class="uploader">
+            <label class="file-drop" for="outward-file">
+              <input id="outward-file" type="file" accept=".xlsx,.xls,.csv" hidden>
+              <div class="file-drop-inner">
+                <div class="file-icon">⬆</div>
+                <div><b>Choose file</b> or drop Excel here</div>
+                <div class="muted" id="outward-filename">No file selected</div>
+              </div>
+            </label>
+            <div class="uploader-side">
+              <label>Sale Date</label>
+              <input type="date" id="outward-date">
+              <button class="btn primary" id="btn-upload-outward" disabled>Upload &amp; Save</button>
+            </div>
+          </div>
+          <div id="outward-preview" class="preview"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h3>View / Clear a Specific Date</h3></div>
+          <div class="filter-bar">
+            <div><label>Date</label><input type="date" id="scan-view-date"></div>
+            <button class="btn primary" onclick="loadScannedForDate()">View</button>
+            <button class="btn danger" onclick="clearOutwardByDate()">Delete This Date</button>
+          </div>
+          <div class="scroll"><table id="tbl-outward"><thead><tr><th>SKU</th><th>Brand</th><th>Description</th><th>Qty Sold</th></tr></thead><tbody></tbody></table></div>
+        </div>
+      </section>
+
+      <!-- ============ PHYSICAL STOCK ============ -->
+      <section id="tab-physical" class="tab">
+        <div class="card">
+          <div class="card-head"><h3>Physical Stock Entry</h3>
+            <span class="muted">Data shown is for the selected date · Same-date entries update in place.</span>
+          </div>
+          <div class="filter-bar">
+            <div><label>Date</label><input type="date" id="phys-date"></div>
+            <div><label>&nbsp;</label><input id="phys-search" class="input" placeholder="Filter SKU or Brand…" oninput="filterPhysicalRows()"></div>
+            <button class="btn primary" onclick="renderPhysical()">Load</button>
+            <button class="btn primary" onclick="savePhysical()">Save</button>
+          </div>
+          <div class="scroll"><table id="tbl-physical"><thead><tr><th>SKU</th><th>Brand</th><th>Description</th><th>Qty Sold</th><th>In Open</th><th>In Box</th><th>In Display</th><th>Total</th><th>Updated</th></tr></thead><tbody></tbody></table></div>
+        </div>
+      </section>
+
+      <!-- ============ STOCK COMPARISON ============ -->
+      <section id="tab-compare" class="tab">
+        <div class="card">
+          <div class="card-head"><h3>Upload Book Stock (Outward + Closing)</h3>
+            <span class="muted">Col A raw · Col B <b>Book Outward Qty</b> · Col C <b>Closing Balance</b>. Uploads for the same date replace previous rows for that date only.</span>
+          </div>
+          <div class="uploader">
+            <label class="file-drop" for="tally-file">
+              <input id="tally-file" type="file" accept=".xlsx,.xls,.csv" hidden>
+              <div class="file-drop-inner">
+                <div class="file-icon">⬆</div>
+                <div><b>Choose file</b> or drop Excel here</div>
+                <div class="muted" id="tally-filename">No file selected</div>
+              </div>
+            </label>
+            <div class="uploader-side">
+              <label>Date</label>
+              <input type="date" id="tally-date">
+              <button class="btn primary" id="btn-upload-tally" disabled>Upload Book Stock</button>
+            </div>
+          </div>
+          <div id="tally-preview" class="preview"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h3>Comparison Date</h3></div>
+          <div class="filter-bar">
+            <div><label>Date</label><input type="date" id="compare-date"></div>
+            <button class="btn primary" onclick="loadComparison()">Load Comparisons</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h3>1️⃣ Scanned Outward vs Book Outward</h3>
+            <div class="grow"></div>
+            <select id="outcmp-filter" onchange="renderOutwardCompare()">
+              <option value="">All</option>
+              <option value="MATCH">Match</option>
+              <option value="OVER SCANNED">Over Scanned</option>
+              <option value="UNDER SCANNED">Under Scanned</option>
+              <option value="SCAN WITHOUT BILL">Scan Without Bill</option>
+              <option value="BILL WITHOUT SCAN">Bill Without Scan</option>
+              <option value="CUSTOMER RETURN">Customer Return</option>
+            </select>
+          </div>
+          <div class="scroll"><table id="tbl-outcompare"><thead><tr><th>SKU</th><th>Brand</th><th>Description</th><th>Scanned</th><th>Book Outward</th><th>Diff</th><th>Status</th><th>Reason</th></tr></thead><tbody></tbody></table></div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h3>2️⃣ Physical Stock vs Closing Balance</h3>
+            <div class="grow"></div>
+            <select id="cmp-filter" onchange="renderCompare()">
+              <option value="">All</option>
+              <option value="MATCH">Match</option>
+              <option value="EXCESS">Excess</option>
+              <option value="SHORT">Short</option>
+              <option value="PURCHASE PENDING">Purchase Pending</option>
+              <option value="MISSING PHYSICAL">Missing Physical</option>
+              <option value="MISSING BOOK">Missing Book</option>
+            </select>
+          </div>
+          <div class="scroll"><table id="tbl-compare"><thead><tr><th>SKU</th><th>Brand</th><th>Description</th><th>Physical</th><th>Closing</th><th>Diff</th><th>Status</th><th>Reason</th></tr></thead><tbody></tbody></table></div>
+        </div>
+      </section>
+
+      <!-- ============ MSL & REORDER ============ -->
+      <section id="tab-msl" class="tab">
+        <div class="card">
+          <div class="card-head"><h3>Sales-Based Suggestion</h3>
+            <span class="muted">Suggested = ⌈(sales in window ÷ window days) × buffer days⌉. Edit <b>MSL</b> inline to override.</span>
+          </div>
+          <div class="filter-bar">
+            <div><label>Window</label>
+              <select id="msl-window">
+                <option value="30">Last 30 days</option>
+                <option value="60">Last 60 days</option>
+                <option value="90">Last 90 days</option>
+              </select>
+            </div>
+            <div><label>Buffer days</label><input type="number" id="msl-buffer" value="30" min="1"></div>
+            <button class="btn primary" onclick="calcMSL(false)">Calculate Suggestions</button>
+            <button class="btn ghost" onclick="calcMSL(true)">Apply Suggestions to MSL</button>
+          </div>
+          <div class="scroll"><table id="tbl-msl"><thead><tr><th>SKU</th><th>Brand</th><th>Description</th><th>Total Sales</th><th>Avg / Day</th><th>MSL (editable)</th><th>Suggested</th></tr></thead><tbody></tbody></table></div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h3>Reorder View</h3></div>
+          <div class="filter-bar">
+            <div><label>Physical Stock Date</label><input type="date" id="reorder-date"></div>
+            <button class="btn primary" onclick="loadReorder()">Load</button>
+          </div>
+          <div class="scroll"><table id="tbl-reorder-full"><thead><tr><th>SKU</th><th>Brand</th><th>Stock</th><th>Pipeline</th><th>MSL</th><th>Suggested Order</th></tr></thead><tbody></tbody></table></div>
+        </div>
+      </section>
+
+      <!-- ============ PURCHASE ORDERS ============ -->
+      <section id="tab-orders" class="tab">
+        <div class="two-col">
+          <div class="card">
+            <div class="card-head"><h3>Create Order (Form)</h3>
+              <span class="muted">Type SKU (autocomplete) · type Qty · press <b>Enter</b> to add · repeat.</span>
+            </div>
+            <div class="form-grid">
+              <div><label>Order Of</label>
+                <div class="combo">
+                  <select id="ord-of"></select>
+                  <input type="text" id="ord-of-new" placeholder="Add new…">
+                  <button class="btn tiny" onclick="addOrderType()">+</button>
+                </div>
+              </div>
+              <div><label>Customer Name</label>
+                <input type="text" id="ord-cust" list="dl-customers" placeholder="Type or pick customer…">
+              </div>
+              <div><label>Billing Name</label>
+                <input type="text" id="ord-bill" list="dl-billings" placeholder="Type or pick billing name…">
+              </div>
+              <div><label>Brand</label>
+                <div class="combo">
+                  <select id="ord-brand"></select>
+                  <input type="text" id="ord-brand-new" placeholder="Add new…">
+                  <button class="btn tiny" onclick="addBrand()">+</button>
+                </div>
+              </div>
+            </div>
+            <div class="order-adder">
+              <div><label>SKU (type to search — filtered by Brand)</label>
+                <input type="text" id="oi-sku" list="dl-skus-brand" autocomplete="off" placeholder="Select Brand above, then start typing SKU…">
+              </div>
+              <div><label>Quantity</label>
+                <input type="number" min="1" value="1" id="oi-qty" onfocus="this.select()">
+              </div>
+              <div style="display:flex;align-items:end"><button class="btn primary" onclick="addPendingItem()">↵ Add</button></div>
+            </div>
+            <div class="order-items">
+              <div class="items-head">
+                <b>Pending Items <span class="muted" id="oi-count">(0)</span></b>
+                <button class="btn ghost tiny" onclick="clearPendingItems()">Clear All</button>
+              </div>
+              <div class="scroll" style="max-height:220px"><table id="tbl-pending"><thead><tr><th>#</th><th>SKU</th><th>Qty</th><th>Description</th><th></th></tr></thead><tbody></tbody></table></div>
+            </div>
+            <div class="right"><button class="btn primary" onclick="placeOrder()">Place Order &amp; Download Excel</button></div>
+          </div>
+
+          <div class="card">
+            <div class="card-head"><h3>Bulk Order Upload</h3>
+              <span class="muted">Excel · Col A = SKU · Col B = Qty · Col C = Description (optional, ignored).</span>
+            </div>
+            <div class="form-grid">
+              <div><label>Order Of</label><select id="bord-of"></select></div>
+              <div><label>Customer Name</label>
+                <input type="text" id="bord-cust" list="dl-customers" placeholder="Type or pick…">
+              </div>
+              <div><label>Billing Name</label>
+                <input type="text" id="bord-bill" list="dl-billings" placeholder="Type or pick…">
+              </div>
+              <div><label>Brand</label><select id="bord-brand"></select></div>
+            </div>
+            <label class="file-drop" for="order-file">
+              <input id="order-file" type="file" accept=".xlsx,.xls,.csv" hidden>
+              <div class="file-drop-inner">
+                <div class="file-icon">⬆</div>
+                <div><b>Choose file</b> or drop Excel here</div>
+                <div class="muted" id="order-filename">No file selected</div>
+              </div>
+            </label>
+            <div id="order-preview" class="preview"></div>
+            <div class="right"><button class="btn primary" id="btn-upload-order" disabled>Place Bulk Order</button></div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h3>All Orders</h3></div>
+          <div class="filter-bar">
+            <div><label>From</label><input type="date" id="ord-from"></div>
+            <div><label>To</label><input type="date" id="ord-to"></div>
+            <div><label>Status</label>
+              <select id="ord-status">
+                <option value="">All</option>
+                <option value="Pending">Pending</option>
+                <option value="Partial">Partial</option>
+                <option value="Completed">Completed</option>
+              </select>
+            </div>
+            <div><label>Customer</label>
+              <input type="text" id="ord-filter-cust" list="dl-customers" placeholder="Any customer">
+            </div>
+            <button class="btn primary" onclick="loadOrders()">Apply Filters</button>
+          </div>
+          <div class="scroll"><table id="tbl-orders"><thead><tr><th>Order ID</th><th>Date</th><th>Order Of</th><th>Customer</th><th>Billing</th><th>Brand</th><th>SKU</th><th>Ordered</th><th>Received</th><th>Status</th></tr></thead><tbody></tbody></table></div>
+        </div>
+      </section>
+
+      <!-- ============ RECEIVED MATERIAL ============ -->
+      <section id="tab-inward" class="tab">
+        <div class="card">
+          <div class="card-head"><h3>Open Order Lines to Receive</h3>
+            <span class="muted">Apply at least one filter (date, customer, or SKU) to load matching open lines.</span>
+          </div>
+          <div class="filter-bar">
+            <div><label>Order From</label><input type="date" id="inw-from"></div>
+            <div><label>Order To</label><input type="date" id="inw-to"></div>
+            <div><label>Customer</label>
+              <input type="text" id="inw-cust" list="dl-customers" placeholder="Any customer">
+            </div>
+            <div><label>SKU</label>
+              <input type="text" id="inw-sku" list="dl-skus" placeholder="Any SKU">
+            </div>
+            <button class="btn primary" onclick="loadOpenOrderLines()">Apply</button>
+            <button class="btn ghost" onclick="clearInwardFilters()">Clear</button>
+          </div>
+          <div id="inw-empty" class="empty-note">Set a filter above and click <b>Apply</b> to view open order lines.</div>
+          <div id="inw-table-wrap" class="scroll hidden"><table id="tbl-inward"><thead><tr><th>Order ID</th><th>Order Date</th><th>SKU</th><th>Brand</th><th>Customer</th><th>Ordered</th><th>Received</th><th>Pending</th><th>Receive Now</th><th>Received Date</th><th>Action</th></tr></thead><tbody></tbody></table></div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h3>Bulk Receive (Any SKU)</h3>
+            <span class="muted">Excel · Col A = SKU · Col B = Qty. Allocates FIFO to open orders. Un-ordered SKUs are recorded as <b>Not Ordered</b> and surfaced on the Dashboard.</span>
+          </div>
+          <div class="filter-bar">
+            <div><label>Received Date</label><input type="date" id="inw-rdate"></div>
+          </div>
+          <div class="uploader">
+            <label class="file-drop" for="inward-file">
+              <input id="inward-file" type="file" accept=".xlsx,.xls,.csv" hidden>
+              <div class="file-drop-inner">
+                <div class="file-icon">⬆</div>
+                <div><b>Choose file</b> or drop Excel here</div>
+                <div class="muted" id="inward-filename">No file selected</div>
+              </div>
+            </label>
+            <div class="uploader-side">
+              <button class="btn primary" id="btn-upload-inward" disabled>Process Inward</button>
+            </div>
+          </div>
+          <div id="inward-preview" class="preview"></div>
+        </div>
+      </section>
+
+      <!-- ============ ORDER SUMMARY ============ -->
+      <section id="tab-summary" class="tab">
+        <div class="card">
+          <div class="card-head"><h3>Order Summary — By Customer</h3></div>
+          <div class="filter-bar">
+            <div><label>Customer</label>
+              <input type="text" id="sum-customer" list="dl-customers" placeholder="Any customer">
+            </div>
+            <div><label>Order Of</label><select id="sum-orderof"><option value="">All</option></select></div>
+            <div><label>Status</label>
+              <select id="sum-status">
+                <option value="">All</option>
+                <option value="Pending">Pending</option>
+                <option value="Partial">Partially Received</option>
+                <option value="Completed">Received</option>
+              </select>
+            </div>
+            <div><label>Date From</label><input type="date" id="sum-from"></div>
+            <div><label>Date To</label><input type="date" id="sum-to"></div>
+            <button class="btn primary" onclick="loadSummary()">Apply</button>
+            <button class="btn ghost" onclick="clearSummaryFilters()">Clear</button>
+            <button class="btn ghost" onclick="downloadSummary()">⬇ Download Excel</button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h3>By Customer</h3>
+            <span class="muted">Click a customer row to expand SKUs punched in their orders.</span>
+          </div>
+          <div class="scroll"><table id="tbl-summary-cust"><thead><tr><th></th><th>Customer</th><th>Orders</th><th>Lines</th><th>Ordered</th><th>Received</th><th>Pending</th></tr></thead><tbody></tbody></table></div>
+        </div>
+      </section>
+
+      <!-- ============ MASTERS ============ -->
+      <section id="tab-masters" class="tab">
+        <div class="two-col">
+          <div class="card">
+            <div class="card-head"><h3>SKU Master</h3></div>
+            <div class="filter-bar">
+              <div style="flex:1"><label>Look up SKU</label>
+                <input type="text" id="m-sku-pick" list="dl-skus" placeholder="Type SKU to view/edit…" oninput="onMasterSkuPick()">
+              </div>
+              <button class="btn primary" onclick="showAddSkuForm()">+ Add SKU</button>
+            </div>
+            <div id="m-details" class="hidden">
+              <div class="form-grid">
+                <div><label>SKU</label><input id="m-sku" type="text"></div>
+                <div><label>Brand</label><select id="m-brand"></select></div>
+                <div><label>Description</label><input id="m-desc" type="text"></div>
+                <div><label>MSL</label><input id="m-msl" type="number" min="0" value="0"></div>
+              </div>
+              <div class="right" style="gap:8px">
+                <button class="btn danger" onclick="deleteSkuCurrent()">Delete</button>
+                <button class="btn primary" onclick="saveSku()">Save</button>
+              </div>
+            </div>
+            <div id="m-empty" class="muted" style="padding:16px;text-align:center">Type or select a SKU above to view/edit its details, or click <b>+ Add SKU</b>.</div>
+          </div>
+          <div class="card">
+            <div class="card-head"><h3>Brands, Order Types &amp; Customers</h3></div>
+            <div class="two-mini">
+              <div>
+                <label>Brands</label>
+                <div class="combo"><input id="brand-new" type="text" placeholder="New brand"><button class="btn tiny" onclick="addBrand()">Add</button></div>
+                <ul id="list-brands" class="chips"></ul>
+              </div>
+              <div>
+                <label>Order Types</label>
+                <div class="combo"><input id="otype-new" type="text" placeholder="New order type"><button class="btn tiny" onclick="addOrderType()">Add</button></div>
+                <ul id="list-otypes" class="chips"></ul>
+              </div>
+            </div>
+            <div style="margin-top:14px">
+              <label>Customers</label>
+              <div class="combo">
+                <input id="cust-new" type="text" placeholder="Customer name">
+                <input id="cust-bill-new" type="text" placeholder="Default billing name (optional)">
+                <button class="btn tiny" onclick="addCustomerMaster()">Add</button>
+              </div>
+              <ul id="list-customers" class="chips"></ul>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div id="toast" class="toast"></div>
+
+  <?!= include('JavaScript') ?>
+</body>
+</html>

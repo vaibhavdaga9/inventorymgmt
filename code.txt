@@ -1,0 +1,859 @@
+/**
+ * Inventory Tracking Dashboard – Google Apps Script Web App
+ * Bound to Google Sheet ID: 1g3t9ab1sN6dHr4_BSGeepGHQZjhxV64nkhB_Pl3mZHM
+ *
+ * Deploy: Extensions → Apps Script → Deploy → New deployment → Web App
+ */
+
+const SPREADSHEET_ID = '1g3t9ab1sN6dHr4_BSGeepGHQZjhxV64nkhB_Pl3mZHM';
+
+// ---------- Sheet schemas (Date-scoped) ----------
+const SHEETS = {
+  SKU_MASTER:      { name: 'SKU_Master',      headers: ['SKU', 'Brand', 'Description', 'MSL'] },
+  BRANDS:          { name: 'Brands',          headers: ['Brand'] },
+  ORDER_TYPES:     { name: 'Order_Types',     headers: ['Order Of'] },
+  CUSTOMERS:       { name: 'Customers',       headers: ['Customer Name', 'Billing Name'] },
+  SALES_HISTORY:   { name: 'Sales_History',   headers: ['Date', 'SKU', 'Qty', 'Uploaded At'] },
+  PHYSICAL_STOCK:  { name: 'Physical_Stock',  headers: ['Date', 'SKU', 'In Open', 'In Box', 'In Display', 'Total', 'Updated At'] },
+  BOOK_STOCK:      { name: 'Book_Stock',      headers: ['Date', 'SKU', 'Book Outward Qty', 'Closing Balance', 'Raw Description', 'Uploaded At'] },
+  ORDERS:          { name: 'Orders',          headers: ['Order ID', 'Date', 'Order Of', 'Customer Name', 'Billing Name', 'Brand', 'SKU', 'Qty Ordered', 'Description', 'Qty Received', 'Status'] },
+  INWARD:          { name: 'Inward',          headers: ['Date', 'Order ID', 'SKU', 'Qty Received', 'Type'] },
+  MISMATCH_REASONS:{ name: 'Mismatch_Reasons',headers: ['Date', 'Type', 'SKU', 'Reason', 'Updated At'] },
+};
+
+// ---------- Web app entry ----------
+function doGet() {
+  ensureAllSheets_();
+  return HtmlService.createTemplateFromFile('Index')
+    .evaluate()
+    .setTitle('Inventory Dashboard')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL)
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1');
+}
+
+function include(name) {
+  return HtmlService.createHtmlOutputFromFile(name).getContent();
+}
+
+// ---------- Sheet setup ----------
+function ss_() { return SpreadsheetApp.openById(SPREADSHEET_ID); }
+
+function ensureAllSheets_() {
+  const ss = ss_();
+  Object.values(SHEETS).forEach(cfg => {
+    let sh = ss.getSheetByName(cfg.name);
+    if (!sh) {
+      sh = ss.insertSheet(cfg.name);
+      writeHeader_(sh, cfg.headers);
+    } else if (sh.getLastRow() === 0) {
+      writeHeader_(sh, cfg.headers);
+    } else {
+      // Auto-repair headers when schema changes AND wipe stale header cells past schema
+      const cols = Math.max(cfg.headers.length, sh.getLastColumn());
+      const existing = sh.getRange(1, 1, 1, cols).getValues()[0];
+      const trimmed = existing.slice(0, cfg.headers.length).map(v => String(v || '').trim());
+      const target = cfg.headers.map(v => String(v).trim());
+      const mismatch = trimmed.length < target.length || trimmed.some((v, i) => v !== target[i]);
+      if (mismatch) writeHeader_(sh, cfg.headers);
+      // Always clear any stale header cells past the target schema (e.g. old "Status"/"Notes" from previous versions)
+      if (cols > cfg.headers.length) {
+        sh.getRange(1, cfg.headers.length + 1, 1, cols - cfg.headers.length).clearContent();
+      }
+    }
+  });
+  const ot = ss.getSheetByName(SHEETS.ORDER_TYPES.name);
+  if (ot.getLastRow() < 2) ot.getRange(2, 1, 3, 1).setValues([['Stock'], ['Customer'], ['Sample']]);
+}
+
+function writeHeader_(sh, headers) {
+  sh.getRange(1, 1, 1, headers.length).setValues([headers])
+    .setFontWeight('bold').setBackground('#111827').setFontColor('#f9fafb');
+  sh.setFrozenRows(1);
+}
+
+function sheetData_(name) {
+  const sh = ss_().getSheetByName(name);
+  if (!sh || sh.getLastRow() < 2) return [];
+  const values = sh.getRange(2, 1, sh.getLastRow() - 1, sh.getLastColumn()).getValues();
+  const rawHeaders = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0];
+  // Build a map of unique headers → first column index they appear in.
+  // Empty and duplicate headers are ignored so stale columns can never overwrite real data.
+  const headerCols = [];
+  const seen = new Set();
+  rawHeaders.forEach((h, i) => {
+    const key = String(h || '').trim();
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    headerCols.push({ key, col: i });
+  });
+  return values.map(row => {
+    const o = {};
+    headerCols.forEach(hc => { o[hc.key] = row[hc.col]; });
+    return o;
+  });
+}
+
+function clearData_(name) {
+  const sh = ss_().getSheetByName(name);
+  if (!sh) return;
+  if (sh.getLastRow() > 1) sh.getRange(2, 1, sh.getLastRow() - 1, sh.getLastColumn()).clearContent();
+}
+
+function appendRows_(name, rows) {
+  if (!rows || !rows.length) return;
+  const sh = ss_().getSheetByName(name);
+  sh.getRange(sh.getLastRow() + 1, 1, rows.length, rows[0].length).setValues(rows);
+}
+
+// ---------- Utilities ----------
+function extractSku_(raw) {
+  if (raw === null || raw === undefined) return '';
+  return String(raw).trim().split(/\s+/)[0].toUpperCase();
+}
+
+function nowIso_() {
+  return Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm:ss');
+}
+
+function todayStr_() {
+  return Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd');
+}
+
+function normDate_(d) {
+  if (!d) return '';
+  if (d instanceof Date) return Utilities.formatDate(d, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+  return String(d).slice(0, 10);
+}
+
+/**
+ * Aggressively normalise text for comparison: lowercase, trim, collapse whitespace,
+ * strip zero-width, BOM, non-breaking space, tab, etc.
+ */
+function normText_(s) {
+  return String(s == null ? '' : s)
+    .replace(/[\u200B-\u200D\uFEFF\u00A0]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+/** Strip ALL whitespace + invisible chars + lowercase — used for space-insensitive matching. */
+function normLoose_(s) {
+  return String(s == null ? '' : s)
+    .replace(/[\u200B-\u200D\uFEFF\u00A0\s]/g, '')
+    .toLowerCase();
+}
+
+// ---------- Master data ----------
+function api_getMasters() {
+  ensureAllSheets_();
+  return {
+    skus:       sheetData_(SHEETS.SKU_MASTER.name),
+    brands:     sheetData_(SHEETS.BRANDS.name).map(r => r.Brand).filter(Boolean),
+    orderTypes: sheetData_(SHEETS.ORDER_TYPES.name).map(r => r['Order Of']).filter(Boolean),
+    customers:  sheetData_(SHEETS.CUSTOMERS.name),
+  };
+}
+
+function api_upsertSku(sku, brand, description, msl) {
+  const sh = ss_().getSheetByName(SHEETS.SKU_MASTER.name);
+  const skuU = extractSku_(sku);
+  if (!skuU) throw new Error('SKU is required');
+  const rows = sheetData_(SHEETS.SKU_MASTER.name);
+  const idx = rows.findIndex(r => String(r.SKU).toUpperCase() === skuU);
+  if (idx >= 0) {
+    sh.getRange(idx + 2, 1, 1, 4).setValues([[skuU, brand || '', description || '', Number(msl) || 0]]);
+  } else {
+    sh.appendRow([skuU, brand || '', description || '', Number(msl) || 0]);
+  }
+  return api_getMasters();
+}
+
+function api_deleteSku(sku) {
+  const sh = ss_().getSheetByName(SHEETS.SKU_MASTER.name);
+  const rows = sheetData_(SHEETS.SKU_MASTER.name);
+  const idx = rows.findIndex(r => String(r.SKU).toUpperCase() === extractSku_(sku));
+  if (idx >= 0) sh.deleteRow(idx + 2);
+  return api_getMasters();
+}
+
+function api_setMSL(sku, msl) {
+  const sh = ss_().getSheetByName(SHEETS.SKU_MASTER.name);
+  const rows = sheetData_(SHEETS.SKU_MASTER.name);
+  const skuU = extractSku_(sku);
+  const idx = rows.findIndex(r => String(r.SKU).toUpperCase() === skuU);
+  if (idx < 0) throw new Error('SKU not found: ' + skuU);
+  sh.getRange(idx + 2, 4).setValue(Number(msl) || 0);
+  return { sku: skuU, msl: Number(msl) || 0 };
+}
+
+function api_addBrand(brand) {
+  if (!brand) return api_getMasters();
+  const sh = ss_().getSheetByName(SHEETS.BRANDS.name);
+  const existing = sheetData_(SHEETS.BRANDS.name).map(r => String(r.Brand).toUpperCase());
+  if (!existing.includes(String(brand).toUpperCase())) sh.appendRow([brand]);
+  return api_getMasters();
+}
+
+/**
+ * Read SKUs directly from a brand-named sheet (e.g. "Jaquar", "Grohe").
+ * Expected layout: Col A = Code (SKU), Col B = Product Description.
+ * Sheet name match is case-insensitive.
+ * Returns [{sku, description}] — up to a soft cap of 5000 rows.
+ */
+function api_getBrandSkus(brand) {
+  if (!brand) return [];
+  const target = String(brand).trim().toLowerCase();
+  const sheets = ss_().getSheets();
+  const sh = sheets.find(s => s.getName().trim().toLowerCase() === target);
+  if (!sh || sh.getLastRow() < 2) return [];
+  const rows = Math.min(sh.getLastRow() - 1, 5000);
+  const values = sh.getRange(2, 1, rows, 2).getValues();
+  const out = [];
+  values.forEach(r => {
+    const code = r[0];
+    if (!code) return;
+    const codeStr = String(code).trim();
+    if (!codeStr || /^code$/i.test(codeStr) || /^product/i.test(codeStr)) return;
+    out.push({ sku: codeStr, description: String(r[1] || '').trim() });
+  });
+  return out;
+}
+
+function api_addOrderType(type) {
+  if (!type) return api_getMasters();
+  const sh = ss_().getSheetByName(SHEETS.ORDER_TYPES.name);
+  const existing = sheetData_(SHEETS.ORDER_TYPES.name).map(r => String(r['Order Of']).toUpperCase());
+  if (!existing.includes(String(type).toUpperCase())) sh.appendRow([type]);
+  return api_getMasters();
+}
+
+function api_addCustomer(customer, billing) {
+  if (!customer) return api_getMasters();
+  const sh = ss_().getSheetByName(SHEETS.CUSTOMERS.name);
+  const existing = sheetData_(SHEETS.CUSTOMERS.name);
+  const idx = existing.findIndex(r => String(r['Customer Name']).toUpperCase() === String(customer).toUpperCase());
+  if (idx >= 0) {
+    if (billing) sh.getRange(idx + 2, 2).setValue(billing);
+  } else {
+    sh.appendRow([customer, billing || '']);
+  }
+  return api_getMasters();
+}
+
+// ---------- Scanned Outward ----------
+/**
+ * rows: [{sku, qty}] — aggregated from client. Appends to Sales_History; same-day same-SKU accumulates.
+ */
+function api_uploadOutward(rows, saleDate) {
+  ensureAllSheets_();
+  const date = normDate_(saleDate) || todayStr_();
+  const now = nowIso_();
+  const cleaned = (rows || [])
+    .map(r => ({ sku: extractSku_(r.sku), qty: Number(r.qty) || 0 }))
+    .filter(r => r.sku && r.qty !== 0);
+  if (cleaned.length) {
+    appendRows_(SHEETS.SALES_HISTORY.name, cleaned.map(r => [date, r.sku, r.qty, now]));
+  }
+  // Auto-register any new SKUs into master
+  const master = sheetData_(SHEETS.SKU_MASTER.name).map(r => String(r.SKU).toUpperCase());
+  const missing = cleaned
+    .map(r => r.sku)
+    .filter((v, i, a) => a.indexOf(v) === i && !master.includes(v))
+    .map(sku => [sku, '', '', 0]);
+  if (missing.length) appendRows_(SHEETS.SKU_MASTER.name, missing);
+  return { added: cleaned.length, date };
+}
+
+/** Aggregate scanned outward for a given date from Sales_History. */
+function api_getScannedForDate(date) {
+  const d = normDate_(date) || todayStr_();
+  const sales = sheetData_(SHEETS.SALES_HISTORY.name);
+  const agg = new Map();
+  sales.forEach(r => {
+    if (normDate_(r.Date) !== d) return;
+    const sku = String(r.SKU).toUpperCase();
+    agg.set(sku, (agg.get(sku) || 0) + (Number(r.Qty) || 0));
+  });
+  const master = sheetData_(SHEETS.SKU_MASTER.name);
+  const mMap = new Map(master.map(r => [String(r.SKU).toUpperCase(), r]));
+  return Array.from(agg.entries()).map(([sku, qty]) => {
+    const m = mMap.get(sku) || {};
+    return { sku, qty, brand: m.Brand || '', description: m.Description || '' };
+  }).sort((a, b) => a.sku.localeCompare(b.sku));
+}
+
+/** Returns list of unique dates present in Sales_History. */
+function api_getScannedDates() {
+  const sales = sheetData_(SHEETS.SALES_HISTORY.name);
+  const map = new Map();
+  sales.forEach(r => {
+    const d = normDate_(r.Date);
+    if (!d) return;
+    const cur = map.get(d) || { date: d, lines: 0, qty: 0 };
+    cur.lines += 1;
+    cur.qty += Number(r.Qty) || 0;
+    map.set(d, cur);
+  });
+  return Array.from(map.values()).sort((a, b) => b.date.localeCompare(a.date));
+}
+
+/** Delete all Sales_History rows for a given date. */
+function api_clearOutwardByDate(dateStr) {
+  ensureAllSheets_();
+  const d = normDate_(dateStr);
+  if (!d) throw new Error('Date required');
+  const rows = sheetData_(SHEETS.SALES_HISTORY.name);
+  const keep = [];
+  let deleted = 0;
+  rows.forEach(r => {
+    if (normDate_(r.Date) === d) { deleted++; return; }
+    keep.push([normDate_(r.Date), r.SKU, r.Qty, r['Uploaded At'] || nowIso_()]);
+  });
+  clearData_(SHEETS.SALES_HISTORY.name);
+  if (keep.length) appendRows_(SHEETS.SALES_HISTORY.name, keep);
+  return { deleted };
+}
+
+// ---------- Physical stock (date-scoped) ----------
+/**
+ * Returns SKUs seen in either scanned outward for `date` OR previously counted physical for `date`.
+ * If physical rows for that date exist, their values are shown; otherwise defaults to 0.
+ */
+function api_getPhysicalStockView(date) {
+  const d = normDate_(date) || todayStr_();
+  const scanned = api_getScannedForDate(d);
+  const phys = sheetData_(SHEETS.PHYSICAL_STOCK.name).filter(r => normDate_(r.Date) === d);
+  const master = sheetData_(SHEETS.SKU_MASTER.name);
+  const mMap = new Map(master.map(r => [String(r.SKU).toUpperCase(), r]));
+  const sMap = new Map(scanned.map(r => [r.sku, r.qty]));
+  const pMap = new Map(phys.map(r => [String(r.SKU).toUpperCase(), r]));
+
+  const skus = new Set([...sMap.keys(), ...pMap.keys()]);
+  return Array.from(skus).map(sku => {
+    const p = pMap.get(sku) || {};
+    const m = mMap.get(sku) || {};
+    return {
+      date: d,
+      sku,
+      brand: m.Brand || '',
+      description: m.Description || '',
+      qtySold: sMap.get(sku) || 0,
+      inOpen: Number(p['In Open']) || 0,
+      inBox: Number(p['In Box']) || 0,
+      inDisplay: Number(p['In Display']) || 0,
+      total: Number(p['Total']) || 0,
+      updatedAt: p['Updated At'] || '',
+    };
+  }).sort((a, b) => a.sku.localeCompare(b.sku));
+}
+
+/** Upsert physical stock rows keyed by (Date, SKU). */
+function api_savePhysicalStock(date, entries) {
+  const d = normDate_(date) || todayStr_();
+  const sh = ss_().getSheetByName(SHEETS.PHYSICAL_STOCK.name);
+  const existing = sheetData_(SHEETS.PHYSICAL_STOCK.name);
+  const idxMap = new Map();
+  existing.forEach((r, i) => {
+    const key = normDate_(r.Date) + '|' + String(r.SKU).toUpperCase();
+    idxMap.set(key, i + 2);
+  });
+  const now = nowIso_();
+  (entries || []).forEach(e => {
+    const sku = extractSku_(e.sku);
+    if (!sku) return;
+    const inOpen = Number(e.inOpen) || 0;
+    const inBox = Number(e.inBox) || 0;
+    const inDisplay = Number(e.inDisplay) || 0;
+    const total = inOpen + inBox + inDisplay;
+    const key = d + '|' + sku;
+    const row = [d, sku, inOpen, inBox, inDisplay, total, now];
+    if (idxMap.has(key)) {
+      sh.getRange(idxMap.get(key), 1, 1, 7).setValues([row]);
+    } else {
+      sh.appendRow(row);
+      idxMap.set(key, sh.getLastRow());
+    }
+  });
+  return { saved: (entries || []).length, date: d };
+}
+
+// ---------- Book stock (Tally) upload & comparison (date-scoped) ----------
+/**
+ * rows: [{raw, outwardQty, closing}]  date: yyyy-mm-dd
+ * Uploads for the same date replace prior book-stock rows for that date; other dates untouched.
+ */
+function api_uploadBookStock(rows, date) {
+  ensureAllSheets_();
+  const d = normDate_(date) || todayStr_();
+  // Wipe previous rows for this date
+  const sh = ss_().getSheetByName(SHEETS.BOOK_STOCK.name);
+  const existing = sheetData_(SHEETS.BOOK_STOCK.name);
+  const keep = existing.filter(r => normDate_(r.Date) !== d)
+    .map(r => [normDate_(r.Date), r.SKU, r['Book Outward Qty'], r['Closing Balance'], r['Raw Description'], r['Uploaded At']]);
+  clearData_(SHEETS.BOOK_STOCK.name);
+  if (keep.length) appendRows_(SHEETS.BOOK_STOCK.name, keep);
+  // Aggregate incoming
+  const now = nowIso_();
+  const agg = new Map();
+  (rows || []).forEach(r => {
+    const raw = String(r.raw || '').trim();
+    if (!raw) return;
+    const sku = extractSku_(raw);
+    if (!sku) return;
+    const outward = (r.outwardQty === '' || r.outwardQty == null) ? 0 : Number(r.outwardQty);
+    const closing = (r.closing === '' || r.closing == null) ? 0 : Number(r.closing);
+    const closingBlank = (r.closing === '' || r.closing == null);
+    const prev = agg.get(sku) || { outward: 0, closing: 0, closingBlank: true, raw };
+    agg.set(sku, {
+      outward: prev.outward + (isNaN(outward) ? 0 : outward),
+      closing: prev.closing + (isNaN(closing) ? 0 : closing),
+      closingBlank: prev.closingBlank && closingBlank,
+      raw: prev.raw,
+    });
+  });
+  const out = Array.from(agg.entries()).map(([sku, v]) => [
+    d, sku, v.outward, v.closingBlank ? '' : v.closing, v.raw, now
+  ]);
+  if (out.length) appendRows_(SHEETS.BOOK_STOCK.name, out);
+  return { count: out.length, date: d };
+}
+
+/** Returns dates present in Book_Stock. */
+function api_getBookDates() {
+  const rows = sheetData_(SHEETS.BOOK_STOCK.name);
+  const set = new Set(rows.map(r => normDate_(r.Date)).filter(Boolean));
+  return Array.from(set).sort((a, b) => b.localeCompare(a));
+}
+
+function api_getOutwardComparison(date) {
+  const d = normDate_(date) || todayStr_();
+  const scanned = api_getScannedForDate(d);
+  const book = sheetData_(SHEETS.BOOK_STOCK.name).filter(r => normDate_(r.Date) === d);
+  const master = sheetData_(SHEETS.SKU_MASTER.name);
+  const reasons = _reasonMap_(d, 'outward');
+  const mMap = new Map(master.map(r => [String(r.SKU).toUpperCase(), r]));
+  const sMap = new Map(scanned.map(r => [r.sku, r.qty]));
+  const bMap = new Map(book.map(r => [String(r.SKU).toUpperCase(), r]));
+
+  const skus = new Set([...sMap.keys(), ...bMap.keys()]);
+  return Array.from(skus).map(sku => {
+    const scannedQty = sMap.get(sku) || 0;
+    const b = bMap.get(sku) || {};
+    const bookOutward = Number(b['Book Outward Qty']) || 0;
+    const diff = scannedQty - bookOutward;
+    const m = mMap.get(sku) || {};
+    let status = 'MATCH';
+    if (bookOutward < 0) status = 'CUSTOMER RETURN';
+    else if (!sMap.has(sku)) status = 'BILL WITHOUT SCAN';
+    else if (!bMap.has(sku)) status = 'SCAN WITHOUT BILL';
+    else if (diff !== 0) status = diff > 0 ? 'OVER SCANNED' : 'UNDER SCANNED';
+    return {
+      date: d, sku,
+      brand: m.Brand || '',
+      description: m.Description || b['Raw Description'] || '',
+      scanned: scannedQty,
+      bookOutward,
+      diff, status,
+      reason: reasons.get(sku) || '',
+    };
+  }).sort((a, b) => a.sku.localeCompare(b.sku));
+}
+
+function api_getComparison(date) {
+  const d = normDate_(date) || todayStr_();
+  const phys = sheetData_(SHEETS.PHYSICAL_STOCK.name).filter(r => normDate_(r.Date) === d);
+  const book = sheetData_(SHEETS.BOOK_STOCK.name).filter(r => normDate_(r.Date) === d);
+  const master = sheetData_(SHEETS.SKU_MASTER.name);
+  const reasons = _reasonMap_(d, 'stock');
+  const mMap = new Map(master.map(r => [String(r.SKU).toUpperCase(), r]));
+  const pMap = new Map(phys.map(r => [String(r.SKU).toUpperCase(), r]));
+  const bMap = new Map(book.map(r => [String(r.SKU).toUpperCase(), r]));
+
+  const skus = new Set([...pMap.keys(), ...bMap.keys()]);
+  return Array.from(skus).map(sku => {
+    const p = pMap.get(sku) || {};
+    const b = bMap.get(sku) || {};
+    const m = mMap.get(sku) || {};
+    const physical = Number(p['Total']) || 0;
+    const closingRaw = b['Closing Balance'];
+    const closingBlank = (closingRaw === '' || closingRaw === null || closingRaw === undefined);
+    const closing = closingBlank ? 0 : (Number(closingRaw) || 0);
+    const diff = physical - closing;
+    let status = 'MATCH';
+    if (closing < 0) status = 'PURCHASE PENDING';
+    else if (!pMap.has(sku)) status = 'MISSING PHYSICAL';
+    else if (!bMap.has(sku)) status = 'MISSING BOOK';
+    else if (diff !== 0) status = diff > 0 ? 'EXCESS' : 'SHORT';
+    return {
+      date: d, sku,
+      brand: m.Brand || '',
+      description: m.Description || b['Raw Description'] || '',
+      physical,
+      bookQty: closing,
+      closingBlank,
+      diff, status,
+      reason: reasons.get(sku) || '',
+    };
+  }).sort((a, b) => a.sku.localeCompare(b.sku));
+}
+
+function _reasonMap_(date, type) {
+  const rows = sheetData_(SHEETS.MISMATCH_REASONS.name);
+  const map = new Map();
+  rows.forEach(r => {
+    if (normDate_(r.Date) === date && String(r.Type) === type) {
+      map.set(String(r.SKU).toUpperCase(), r.Reason || '');
+    }
+  });
+  return map;
+}
+
+/**
+ * Save or clear a mismatch reason for a given date + type + sku.
+ * type: 'outward' | 'stock'
+ * reason: '' clears the row.
+ */
+function api_setMismatchReason(date, type, sku, reason) {
+  ensureAllSheets_();
+  const d = normDate_(date);
+  const t = String(type || '').toLowerCase();
+  const s = extractSku_(sku);
+  if (!d || !t || !s) throw new Error('date, type and sku are required');
+  const sh = ss_().getSheetByName(SHEETS.MISMATCH_REASONS.name);
+  const rows = sheetData_(SHEETS.MISMATCH_REASONS.name);
+  const idx = rows.findIndex(r =>
+    normDate_(r.Date) === d && String(r.Type).toLowerCase() === t && String(r.SKU).toUpperCase() === s);
+  const now = nowIso_();
+  if (!reason) {
+    if (idx >= 0) sh.deleteRow(idx + 2);
+    return { cleared: true };
+  }
+  if (idx >= 0) sh.getRange(idx + 2, 1, 1, 5).setValues([[d, t, s, reason, now]]);
+  else sh.appendRow([d, t, s, reason, now]);
+  return { saved: true };
+}
+
+// ---------- MSL / Reorder ----------
+function api_calcMSL(windowDays, bufferDays, applyToSheet) {
+  windowDays = Number(windowDays) || 30;
+  bufferDays = Number(bufferDays) || windowDays;
+  const sales = sheetData_(SHEETS.SALES_HISTORY.name);
+  const now = new Date();
+  const cutoff = new Date(now.getTime() - windowDays * 24 * 60 * 60 * 1000);
+  const agg = new Map();
+  sales.forEach(r => {
+    const dstr = normDate_(r.Date);
+    const dd = new Date(dstr);
+    if (isNaN(dd.getTime()) || dd < cutoff) return;
+    const sku = String(r.SKU).toUpperCase();
+    agg.set(sku, (agg.get(sku) || 0) + (Number(r.Qty) || 0));
+  });
+  const master = sheetData_(SHEETS.SKU_MASTER.name);
+  const mSh = ss_().getSheetByName(SHEETS.SKU_MASTER.name);
+  const results = master.map((row, i) => {
+    const sku = String(row.SKU).toUpperCase();
+    const totalSales = agg.get(sku) || 0;
+    const avgDaily = totalSales / windowDays;
+    const suggested = Math.ceil(avgDaily * bufferDays);
+    if (applyToSheet) mSh.getRange(i + 2, 4).setValue(suggested);
+    return {
+      sku,
+      brand: row.Brand || '',
+      description: row.Description || '',
+      totalSales,
+      avgDaily: Number(avgDaily.toFixed(2)),
+      suggested,
+      currentMsl: Number(row.MSL) || 0,
+    };
+  });
+  return { windowDays, bufferDays, rows: results };
+}
+
+function api_getReorderSuggestions(date) {
+  const d = normDate_(date) || todayStr_();
+  const master = sheetData_(SHEETS.SKU_MASTER.name);
+  const phys = sheetData_(SHEETS.PHYSICAL_STOCK.name).filter(r => normDate_(r.Date) === d);
+  const orders = sheetData_(SHEETS.ORDERS.name);
+  const pMap = new Map(phys.map(r => [String(r.SKU).toUpperCase(), Number(r.Total) || 0]));
+  const pending = new Map();
+  orders.forEach(o => {
+    if (o.Status === 'Completed') return;
+    const sku = String(o.SKU).toUpperCase();
+    pending.set(sku, (pending.get(sku) || 0) + ((Number(o['Qty Ordered']) || 0) - (Number(o['Qty Received']) || 0)));
+  });
+  return master.map(r => {
+    const sku = String(r.SKU).toUpperCase();
+    const stock = pMap.get(sku) || 0;
+    const inPipeline = pending.get(sku) || 0;
+    const msl = Number(r.MSL) || 0;
+    const suggested = Math.max(0, msl - stock - inPipeline);
+    return {
+      sku, brand: r.Brand, description: r.Description,
+      msl, stock, inPipeline, suggested,
+      reorder: suggested > 0,
+    };
+  }).sort((a, b) => (b.suggested - a.suggested) || a.sku.localeCompare(b.sku));
+}
+
+// ---------- Orders ----------
+function _newOrderId_() {
+  const stamp = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyyMMddHHmmss');
+  return 'PO-' + stamp + '-' + Math.floor(Math.random() * 900 + 100);
+}
+
+function api_placeOrder(payload) {
+  ensureAllSheets_();
+  const orderId = _newOrderId_();
+  const date = todayStr_();
+  const orderOf = payload.orderOf || '';
+  const customer = String(payload.customerName || '').trim();
+  const billing = String(payload.billingName || '').trim();
+  const items = (payload.items || []).filter(it => extractSku_(it.sku) && Number(it.qty) > 0);
+  if (!items.length) throw new Error('No valid items in order');
+  const rows = items.map(it => [
+    orderId, date, orderOf, customer, billing,
+    it.brand || '', extractSku_(it.sku),
+    Number(it.qty), String(it.description || ''), 0, 'Pending'
+  ]);
+  appendRows_(SHEETS.ORDERS.name, rows);
+  if (customer) api_addCustomer(customer, billing);
+  return { orderId, count: rows.length, date };
+}
+
+/**
+ * Get orders with filters.
+ * filters: { customer, orderOf, status, dateFrom, dateTo, sku }
+ */
+function api_getOrders(filters) {
+  filters = filters || {};
+  const cust    = normLoose_(filters.customer);
+  const orderOf = normText_(filters.orderOf);
+  const status  = String(filters.status   || '').trim();
+  const sku     = normText_(filters.sku).toUpperCase();
+  const all = sheetData_(SHEETS.ORDERS.name);
+  return all.filter(o => {
+    // Customer filter: case-insensitive AND all-spaces-ignored. Both bi-directional contains so
+    // typing "Yash Shah" matches sheet "YashShah", and vice versa.
+    if (cust) {
+      const rowCust = normLoose_(o['Customer Name']);
+      if (!rowCust) return false;
+      if (rowCust.indexOf(cust) < 0 && cust.indexOf(rowCust) < 0) return false;
+    }
+    if (orderOf && normText_(o['Order Of'])       !== orderOf)     return false;
+    if (status  && String(o.Status || '').trim() !== status)       return false;
+    if (sku     && normText_(o.SKU).toUpperCase() !== sku)         return false;
+    const d = normDate_(o.Date);
+    if (filters.dateFrom && d < filters.dateFrom) return false;
+    if (filters.dateTo   && d > filters.dateTo)   return false;
+    return true;
+  });
+}
+
+function api_receiveInward(orderId, sku, qtyReceived, receivedDate) {
+  ensureAllSheets_();
+  const sh = ss_().getSheetByName(SHEETS.ORDERS.name);
+  const rows = sheetData_(SHEETS.ORDERS.name);
+  const skuU = extractSku_(sku);
+  const idx = rows.findIndex(r => r['Order ID'] === orderId && String(r.SKU).toUpperCase() === skuU);
+  if (idx < 0) throw new Error('Order line not found');
+  const ordered = Number(rows[idx]['Qty Ordered']) || 0;
+  const already = Number(rows[idx]['Qty Received']) || 0;
+  const add = Number(qtyReceived) || 0;
+  const newRec = already + add;
+  let status;
+  if (newRec === 0) status = 'Pending';
+  else if (newRec >= ordered) status = 'Completed';
+  else status = 'Partial';
+  sh.getRange(idx + 2, 10, 1, 2).setValues([[newRec, status]]);
+  appendRows_(SHEETS.INWARD.name, [[normDate_(receivedDate) || todayStr_(), orderId, skuU, add, 'Ordered']]);
+  return { orderId, sku: skuU, newRec, status };
+}
+
+/**
+ * Bulk inward: rows [{sku, qty}]. Allocates against oldest pending order lines FIFO.
+ * If no open order line exists for a SKU, still records it in Inward as 'Unplanned'
+ * so dashboard can surface "Not Ordered" receipts.
+ */
+function api_bulkInward(rows, receivedDate) {
+  ensureAllSheets_();
+  const orders = sheetData_(SHEETS.ORDERS.name);
+  const sh = ss_().getSheetByName(SHEETS.ORDERS.name);
+  const rDate = normDate_(receivedDate) || todayStr_();
+  const results = [];
+  (rows || []).forEach(r => {
+    const sku = extractSku_(r.sku);
+    let qty = Number(r.qty) || 0;
+    if (!sku || qty <= 0) return;
+    const candidates = orders
+      .map((o, i) => ({ ...o, _row: i + 2 }))
+      .filter(o => String(o.SKU).toUpperCase() === sku && o.Status !== 'Completed')
+      .sort((a, b) => new Date(a.Date) - new Date(b.Date));
+    for (const c of candidates) {
+      if (qty <= 0) break;
+      const need = (Number(c['Qty Ordered']) || 0) - (Number(c['Qty Received']) || 0);
+      if (need <= 0) continue;
+      const take = Math.min(need, qty);
+      const newRec = (Number(c['Qty Received']) || 0) + take;
+      const status = newRec >= (Number(c['Qty Ordered']) || 0) ? 'Completed' : 'Partial';
+      sh.getRange(c._row, 10, 1, 2).setValues([[newRec, status]]);
+      appendRows_(SHEETS.INWARD.name, [[rDate, c['Order ID'], sku, take, 'Ordered']]);
+      results.push({ orderId: c['Order ID'], sku, taken: take, status });
+      qty -= take;
+    }
+    if (qty > 0) {
+      // Unplanned inward — no open order matched
+      appendRows_(SHEETS.INWARD.name, [[rDate, '', sku, qty, 'Unplanned']]);
+      results.push({ orderId: null, sku, taken: 0, status: 'NOT ORDERED', leftover: qty });
+    }
+  });
+  return results;
+}
+
+/**
+ * View for the Received Material tab:
+ * - Open order lines (any date)
+ * - Optional dateFrom/dateTo filters the order's placement date
+ */
+function api_getOpenOrderLines(filters) {
+  filters = filters || {};
+  return api_getOrders(filters).filter(o => o.Status !== 'Completed').map(o => ({
+    orderId: o['Order ID'],
+    date: normDate_(o.Date),
+    orderOf: o['Order Of'],
+    customer: o['Customer Name'],
+    brand: o.Brand,
+    sku: o.SKU,
+    ordered: Number(o['Qty Ordered']) || 0,
+    received: Number(o['Qty Received']) || 0,
+    pending: (Number(o['Qty Ordered']) || 0) - (Number(o['Qty Received']) || 0),
+    status: o.Status,
+  }));
+}
+
+function api_getInwardHistory(filters) {
+  filters = filters || {};
+  const rows = sheetData_(SHEETS.INWARD.name);
+  return rows.filter(r => {
+    const d = normDate_(r.Date);
+    if (filters.dateFrom && d < filters.dateFrom) return false;
+    if (filters.dateTo && d > filters.dateTo) return false;
+    if (filters.type && r.Type !== filters.type) return false;
+    return true;
+  });
+}
+
+// ---------- Order Summary ----------
+function api_getOrderSummary(filters) {
+  filters = filters || {};
+  const orders = api_getOrders(filters);
+  // Customers dropdown is populated ONLY from unique values in Orders sheet column D.
+  // Do NOT merge with Customers master — the source of truth for filtering must be what's actually in Orders.
+  const allOrders = sheetData_(SHEETS.ORDERS.name);
+  const seen = new Set();
+  const customers = [];
+  allOrders.forEach(o => {
+    const raw = String(o['Customer Name'] || '').trim();
+    if (!raw) return;
+    const key = normLoose_(raw);
+    if (seen.has(key)) return;
+    seen.add(key);
+    customers.push(raw);
+  });
+  customers.sort();
+
+  const grouped = new Map();
+  orders.forEach(o => {
+    const rawName = String(o['Customer Name'] || '').trim();
+    const key = rawName || '(no customer)';
+    const g = grouped.get(key) || { customer: key, orderIds: new Set(), lines: [], totalOrdered: 0, totalReceived: 0 };
+    g.orderIds.add(o['Order ID']);
+    g.lines.push(o);
+    g.totalOrdered += Number(o['Qty Ordered']) || 0;
+    g.totalReceived += Number(o['Qty Received']) || 0;
+    grouped.set(key, g);
+  });
+  const byCustomer = Array.from(grouped.values()).map(g => ({
+    customer: g.customer,
+    orderIds: Array.from(g.orderIds),
+    totalOrdered: g.totalOrdered,
+    totalReceived: g.totalReceived,
+    totalPending: g.totalOrdered - g.totalReceived,
+    lines: g.lines.map(l => ({
+      orderId: l['Order ID'], date: normDate_(l.Date),
+      orderOf: l['Order Of'], brand: l.Brand, sku: l.SKU,
+      ordered: Number(l['Qty Ordered']) || 0,
+      received: Number(l['Qty Received']) || 0,
+      pending: (Number(l['Qty Ordered']) || 0) - (Number(l['Qty Received']) || 0),
+      status: l.Status,
+    })),
+  })).sort((a, b) => a.customer.localeCompare(b.customer));
+
+  return { rows: orders, byCustomer, customers };
+}
+
+// ---------- Dashboard ----------
+function api_debugOrders() {
+  const all = sheetData_(SHEETS.ORDERS.name);
+  Logger.log('Total order rows: ' + all.length);
+  if (all[0]) {
+    Logger.log('First row keys: ' + JSON.stringify(Object.keys(all[0])));
+    Logger.log('First row values: ' + JSON.stringify(all[0]));
+    const cust = all[0]['Customer Name'];
+    Logger.log('First customer name literal: [' + cust + ']');
+    Logger.log('First customer name length: ' + String(cust || '').length);
+    Logger.log('First customer name char codes: ' + Array.from(String(cust || '')).map(c => c.charCodeAt(0)).join(','));
+    Logger.log('normText_(first customer name): [' + normText_(cust) + ']');
+  }
+  const buckets = {};
+  all.forEach(o => {
+    const k = normText_(o['Customer Name']);
+    buckets[k] = (buckets[k] || 0) + 1;
+  });
+  Logger.log('Customer buckets (normalised → count): ' + JSON.stringify(buckets));
+  // Also try filtering with the exact string from row 1
+  if (all[0]) {
+    const testFilter = String(all[0]['Customer Name'] || '');
+    const filtered = api_getOrders({ customer: testFilter });
+    Logger.log('Rows returned when filtering by first row\'s own customer name: ' + filtered.length);
+  }
+  return 'Done — see Execution log for details';
+}
+
+function api_getDashboard(date) {
+  const d = normDate_(date) || todayStr_();
+  const APP_VERSION = 'v7-loose-match';
+  const scanned = api_getScannedForDate(d);
+  const phys = sheetData_(SHEETS.PHYSICAL_STOCK.name).filter(r => normDate_(r.Date) === d);
+  const book = sheetData_(SHEETS.BOOK_STOCK.name).filter(r => normDate_(r.Date) === d);
+  const orders = sheetData_(SHEETS.ORDERS.name);
+  const inward = sheetData_(SHEETS.INWARD.name).filter(r => normDate_(r.Date) === d);
+  const cmp = api_getComparison(d);
+  const outCmp = api_getOutwardComparison(d);
+  const mismatches = cmp.filter(c => c.status !== 'MATCH');
+  const outMismatches = outCmp.filter(c => c.status !== 'MATCH');
+  const pending = orders.filter(o => o.Status !== 'Completed');
+  const reorder = api_getReorderSuggestions(d).filter(r => r.reorder);
+  const notOrdered = inward.filter(r => r.Type === 'Unplanned');
+
+  return {
+    date: d,
+    totalSkus: sheetData_(SHEETS.SKU_MASTER.name).length,
+    totalOutwardQty: scanned.reduce((s, r) => s + r.qty, 0),
+    totalPhysical: phys.reduce((s, r) => s + (Number(r.Total) || 0), 0),
+    totalBook: book.reduce((s, r) => {
+      const c = r['Closing Balance'];
+      return s + ((c === '' || c == null) ? 0 : (Number(c) || 0));
+    }, 0),
+    outMismatchCount: outMismatches.length,
+    mismatchCount: mismatches.length,
+    pendingOrderLines: pending.length,
+    reorderCount: reorder.length,
+    notOrderedReceipts: notOrdered.length,
+    mismatchesTop: mismatches.slice(0, 8),
+    outMismatchesTop: outMismatches.slice(0, 8),
+    reorderTop: reorder.slice(0, 8),
+    notOrderedList: notOrdered.slice(0, 8),
+    appVersion: APP_VERSION,
+  };
+}
