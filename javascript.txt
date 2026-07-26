@@ -176,6 +176,15 @@ function populateDatalists() {
     const custs = state.masters.customers || [];
     dlBill.innerHTML = custs.map(c => `<option value="${esc(c['Billing Name'] || '')}">`).join('');
   }
+  // "Order Of" filter on the Order Summary tab must be populated as soon as masters load,
+  // not only after the Purchase Orders tab (renderOrderForm) has been visited.
+  const sumOf = $('sum-orderof');
+  if (sumOf) {
+    const prev = sumOf.value;
+    sumOf.innerHTML = ['<option value="">All</option>']
+      .concat((state.masters.orderTypes || []).map(o => `<option>${esc(o)}</option>`)).join('');
+    sumOf.value = prev;
+  }
   populateBrandFilteredSkus();
 }
 
