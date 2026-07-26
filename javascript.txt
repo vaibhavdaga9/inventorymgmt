@@ -45,6 +45,19 @@ function fmtSigned(n) { const v = Number(n) || 0; return (v > 0 ? '+' : '') + v.
 function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function todayISO() { return new Date().toISOString().slice(0, 10); }
 function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; }
+/**
+ * Rewrite a <datalist>'s options only if the content actually changed.
+ * Browsers close an open native autocomplete popup the instant the backing
+ * <datalist> is mutated — so re-writing it with identical content on every
+ * keystroke (e.g. while an auto-refresh handler re-fetches the same list)
+ * makes suggestions flash and immediately disappear while typing.
+ */
+function setDatalistHtml(dl, html) {
+  if (!dl) return;
+  if (dl._lastHtml === html) return;
+  dl._lastHtml = html;
+  dl.innerHTML = html;
+}
 
 function rowClass(status) {
   if (status === 'EXCESS' || status === 'OVER SCANNED') return 'diff-excess';
@@ -107,7 +120,7 @@ function onTabShow(tab) {
     // are available even before the fresh async loadSummary() call resolves.
     const cached = state.lastSummary?.customers;
     if (cached && cached.length && $('dl-customers')) {
-      $('dl-customers').innerHTML = cached.map(c => `<option value="${esc(c)}">`).join('');
+      setDatalistHtml($('dl-customers'), cached.map(c => `<option value="${esc(c)}">`).join(''));
     }
     loadSummary();
   }
@@ -161,20 +174,20 @@ document.addEventListener('DOMContentLoaded', () => {
 /* --------- datalists (autocomplete) --------- */
 function populateDatalists() {
   const skus = state.masters.skus || [];
-  $('dl-skus').innerHTML = skus.map(s =>
-    `<option value="${esc(s.SKU)}">${esc(s.Description || '')}</option>`).join('');
+  setDatalistHtml($('dl-skus'), skus.map(s =>
+    `<option value="${esc(s.SKU)}">${esc(s.Description || '')}</option>`).join(''));
   // Customer datalist source of truth is Orders-sheet Col D (see loadSummary()).
   // Always populate here from masters as a best-effort fallback so suggestions are
   // available immediately; loadSummary() will overwrite with the definitive set.
   const dl = $('dl-customers');
   if (dl) {
     const custs = state.masters.customers || [];
-    dl.innerHTML = custs.map(c => `<option value="${esc(c['Customer Name'])}">`).join('');
+    setDatalistHtml(dl, custs.map(c => `<option value="${esc(c['Customer Name'])}">`).join(''));
   }
   const dlBill = $('dl-billings');
   if (dlBill) {
     const custs = state.masters.customers || [];
-    dlBill.innerHTML = custs.map(c => `<option value="${esc(c['Billing Name'] || '')}">`).join('');
+    setDatalistHtml(dlBill, custs.map(c => `<option value="${esc(c['Billing Name'] || '')}">`).join(''));
   }
   // "Order Of" filter on the Order Summary tab must be populated as soon as masters load,
   // not only after the Purchase Orders tab (renderOrderForm) has been visited.
@@ -196,8 +209,8 @@ async function populateBrandFilteredSkus() {
   if (!brand) { dl.innerHTML = ''; return; }
   try {
     const rows = (await callGS('api_getBrandSkus', brand)) || [];
-    dl.innerHTML = rows.map(r =>
-      `<option value="${esc(r.sku)}">${esc(r.description || '')}</option>`).join('');
+    setDatalistHtml(dl, rows.map(r =>
+      `<option value="${esc(r.sku)}">${esc(r.description || '')}</option>`).join(''));
     rows.forEach(r => { state.brandSkuDesc[String(r.sku).trim().toUpperCase()] = r.description || ''; });
     if ($('oi-sku')) {
       $('oi-sku').placeholder = rows.length
@@ -911,9 +924,11 @@ async function loadSummary() {
   const res = (await callGS('api_getOrderSummary', filters)) || { rows: [], byCustomer: [], customers: [] };
   state.lastSummary = res;
 
-  // Populate customer datalist ONLY from actual Orders-sheet names (source of truth)
+  // Populate customer datalist ONLY from actual Orders-sheet names (source of truth).
+  // Skipped when unchanged (see setDatalistHtml) so re-fetching on every keystroke while
+  // typing doesn't reset/close the native autocomplete suggestion popup.
   if ($('dl-customers')) {
-    $('dl-customers').innerHTML = (res.customers || []).map(c => `<option value="${esc(c)}">`).join('');
+    setDatalistHtml($('dl-customers'), (res.customers || []).map(c => `<option value="${esc(c)}">`).join(''));
   }
 
   const tbody = $('tbl-summary-cust').querySelector('tbody');
