@@ -206,7 +206,7 @@ function rebuildSummary_() {
     const customer = String(o['Customer Name'] || '').trim();
     const sku = String(o['SKU'] || '').trim().toUpperCase();
     const billing = String(o['Billing Name'] || '').trim();
-    const key = customer + '||' + sku + '||' + billing;
+    const key = customer + '\u0000' + sku + '\u0000' + billing;
     const existing = map.get(key) || { customer: customer, sku: sku, billing: billing, ordered: 0, received: 0 };
     existing.ordered  += Number(o['Qty Ordered'])  || 0;
     existing.received += Number(o['Qty Received']) || 0;
