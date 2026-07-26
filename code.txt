@@ -823,6 +823,26 @@ function api_getOrderSummary(filters) {
   return { rows: orders, byCustomer, customers };
 }
 
+/**
+ * Lightweight call: returns only the sorted unique customer names from column D of Orders.
+ * Used to populate the Order Summary customer dropdown independently of the heavy summary query.
+ */
+function api_getOrderCustomers() {
+  const all = sheetData_(SHEETS.ORDERS.name);
+  const seen = new Set();
+  const customers = [];
+  all.forEach(function(o) {
+    var raw = String(o['Customer Name'] || '').trim();
+    if (!raw) return;
+    var key = raw.toUpperCase().replace(/\s+/g, '');
+    if (seen.has(key)) return;
+    seen.add(key);
+    customers.push(raw);
+  });
+  customers.sort();
+  return customers;
+}
+
 // ---------- Dashboard ----------
 function api_debugOrders() {
   const all = sheetData_(SHEETS.ORDERS.name);

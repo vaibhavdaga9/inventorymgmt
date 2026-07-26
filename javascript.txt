@@ -116,6 +116,7 @@ function onTabShow(tab) {
   else if (tab === 'orders')   { renderOrderForm(); loadOrders(); }
   else if (tab === 'inward')   { /* no auto-load; user must apply a filter */ }
   else if (tab === 'summary')  {
+    loadSummaryCustomers();
     loadSummary();
   }
   else if (tab === 'masters')  renderMastersLists();
@@ -1026,6 +1027,19 @@ function clearSummaryFilters() {
   ['sum-customer','sum-orderof','sum-status','sum-from','sum-to'].forEach(id => $(id).value = '');
   loadSummary();
 }
+async function loadSummaryCustomers() {
+  try {
+    const names = (await callGS('api_getOrderCustomers')) || [];
+    const sel = $('sum-customer');
+    const prevVal = sel.value;
+    sel.innerHTML = '<option value="">All Customers</option>' +
+      names.map(c => `<option value="${esc(c)}"${c === prevVal ? ' selected' : ''}>${esc(c)}</option>`).join('');
+    // Restore previously selected value if it still exists in the list
+    if (prevVal && sel.value !== prevVal) sel.value = '';
+  } catch (e) {
+    console.error('loadSummaryCustomers error:', e);
+  }
+}
 async function loadSummary() {
   const filters = {
     customer: $('sum-customer').value,
@@ -1036,13 +1050,6 @@ async function loadSummary() {
   };
   const res = (await callGS('api_getOrderSummary', filters)) || { rows: [], byCustomer: [], customers: [] };
   state.lastSummary = res;
-
-  // Repopulate the customer dropdown from unique names in Orders column D.
-  const sel = $('sum-customer');
-  const prevVal = sel.value;
-  sel.innerHTML = '<option value="">All Customers</option>' +
-    (res.customers || []).map(c => `<option value="${esc(c)}"${c === prevVal ? ' selected' : ''}>${esc(c)}</option>`).join('');
-  if (prevVal && sel.value !== prevVal) sel.value = '';
 
   const tbody = $('tbl-summary-cust').querySelector('tbody');
   tbody.innerHTML = res.byCustomer.map((g, i) => `
