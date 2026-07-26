@@ -145,9 +145,39 @@ function normLoose_(s) {
     .toLowerCase();
 }
 
+/**
+ * The Customers sheet is NOT hand-maintained — it is always rebuilt from the unique
+ * "Customer Name" values actually present in the Orders sheet (the real source of truth).
+ * This removes stale/old names left over from manual edits and keeps suggestions in
+ * sync with what customers really exist. Billing Name is carried over from the most
+ * recent order for that customer, if any.
+ */
+function resyncCustomersFromOrders_() {
+  const orders = sheetData_(SHEETS.ORDERS.name);
+  const billingByCustomer = new Map(); // normalised name -> { name, billing }
+  orders.forEach(o => {
+    const name = String(o['Customer Name'] || '').trim();
+    if (!name) return;
+    const key = name.toUpperCase();
+    const billing = String(o['Billing Name'] || '').trim();
+    const existing = billingByCustomer.get(key);
+    if (!existing) {
+      billingByCustomer.set(key, { name, billing });
+    } else if (billing && !existing.billing) {
+      existing.billing = billing;
+    }
+  });
+  const rows = Array.from(billingByCustomer.values())
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .map(c => [c.name, c.billing || '']);
+  clearData_(SHEETS.CUSTOMERS.name);
+  appendRows_(SHEETS.CUSTOMERS.name, rows);
+}
+
 // ---------- Master data ----------
 function api_getMasters() {
   ensureAllSheets_();
+  resyncCustomersFromOrders_();
   return {
     skus:       sheetData_(SHEETS.SKU_MASTER.name),
     brands:     sheetData_(SHEETS.BRANDS.name).map(r => r.Brand).filter(Boolean),

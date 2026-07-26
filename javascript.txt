@@ -116,12 +116,6 @@ function onTabShow(tab) {
   else if (tab === 'orders')   { renderOrderForm(); loadOrders(); }
   else if (tab === 'inward')   { /* no auto-load; user must apply a filter */ }
   else if (tab === 'summary')  {
-    // Pre-populate customer datalist immediately from cached summary data so suggestions
-    // are available even before the fresh async loadSummary() call resolves.
-    const cached = state.lastSummary?.customers;
-    if (cached && cached.length && $('dl-customers')) {
-      setDatalistHtml($('dl-customers'), cached.map(c => `<option value="${esc(c)}">`).join(''));
-    }
     loadSummary();
   }
   else if (tab === 'masters')  renderMastersLists();
@@ -168,6 +162,8 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }, 500));
 
+  setupCustomerAutocompletes();
+
   loadAll();
 });
 
@@ -176,19 +172,9 @@ function populateDatalists() {
   const skus = state.masters.skus || [];
   setDatalistHtml($('dl-skus'), skus.map(s =>
     `<option value="${esc(s.SKU)}">${esc(s.Description || '')}</option>`).join(''));
-  // Customer datalist source of truth is Orders-sheet Col D (see loadSummary()).
-  // Always populate here from masters as a best-effort fallback so suggestions are
-  // available immediately; loadSummary() will overwrite with the definitive set.
-  const dl = $('dl-customers');
-  if (dl) {
-    const custs = state.masters.customers || [];
-    setDatalistHtml(dl, custs.map(c => `<option value="${esc(c['Customer Name'])}">`).join(''));
-  }
-  const dlBill = $('dl-billings');
-  if (dlBill) {
-    const custs = state.masters.customers || [];
-    setDatalistHtml(dlBill, custs.map(c => `<option value="${esc(c['Billing Name'] || '')}">`).join(''));
-  }
+  // Customer/billing suggestions are handled by the custom autocomplete widgets
+  // (see setupCustomerAutocomplete below) which always read live from
+  // state.masters.customers — no datalist population needed here.
   // "Order Of" filter on the Order Summary tab must be populated as soon as masters load,
   // not only after the Purchase Orders tab (renderOrderForm) has been visited.
   const sumOf = $('sum-orderof');
@@ -199,6 +185,117 @@ function populateDatalists() {
     sumOf.value = prev;
   }
   populateBrandFilteredSkus();
+}
+
+/* --------- custom customer/billing autocomplete ---------
+ * The native <datalist> approach was unreliable in this embedded webapp: the
+ * suggestion popup flashed and closed instantly, and picking a name didn't
+ * reliably populate dependent data. This is a small self-contained dropdown
+ * driven entirely by our own JS/state, so it always shows and a click/Enter
+ * always fires the same events a real datalist selection would.
+ */
+function uniqueCustomerNames() {
+  const seen = new Set(); const out = [];
+  (state.masters.customers || []).forEach(c => {
+    const name = String(c['Customer Name'] || '').trim();
+    if (!name) return;
+    const key = name.toUpperCase();
+    if (seen.has(key)) return;
+    seen.add(key); out.push(name);
+  });
+  return out.sort((a, b) => a.localeCompare(b));
+}
+function uniqueBillingNames() {
+  const seen = new Set(); const out = [];
+  (state.masters.customers || []).forEach(c => {
+    const name = String(c['Billing Name'] || '').trim();
+    if (!name) return;
+    const key = name.toUpperCase();
+    if (seen.has(key)) return;
+    seen.add(key); out.push(name);
+  });
+  return out.sort((a, b) => a.localeCompare(b));
+}
+function billingForCustomer(customerName) {
+  const key = String(customerName || '').trim().toUpperCase();
+  if (!key) return '';
+  const row = (state.masters.customers || []).find(c => String(c['Customer Name'] || '').trim().toUpperCase() === key);
+  return row ? String(row['Billing Name'] || '') : '';
+}
+
+function setupAutocomplete(inputId, getOptions, onSelect) {
+  const input = $(inputId);
+  if (!input || input._acWired) return;
+  input._acWired = true;
+  input.removeAttribute('list');
+  input.setAttribute('autocomplete', 'off');
+
+  const wrap = document.createElement('div');
+  wrap.className = 'ac-wrap';
+  input.parentNode.insertBefore(wrap, input);
+  wrap.appendChild(input);
+  const menu = document.createElement('div');
+  menu.className = 'ac-menu hidden';
+  wrap.appendChild(menu);
+
+  let items = [];
+  let activeIdx = -1;
+
+  function highlight() {
+    [...menu.children].forEach((el, i) => el.classList.toggle('active', i === activeIdx));
+    const el = menu.children[activeIdx];
+    if (el) el.scrollIntoView({ block: 'nearest' });
+  }
+  function close() { menu.classList.add('hidden'); activeIdx = -1; }
+  function render() {
+    const q = input.value.trim().toLowerCase();
+    const all = getOptions();
+    items = (q ? all.filter(c => c.toLowerCase().includes(q)) : all).slice(0, 50);
+    activeIdx = -1;
+    if (!items.length) { close(); menu.innerHTML = ''; return; }
+    menu.innerHTML = items.map((c, i) => `<div class="ac-item" data-i="${i}">${esc(c)}</div>`).join('');
+    menu.classList.remove('hidden');
+  }
+  function pick(name) {
+    input.value = name;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    close();
+    if (onSelect) onSelect(name);
+  }
+
+  input.addEventListener('focus', render);
+  input.addEventListener('input', render);
+  input.addEventListener('keydown', e => {
+    if (menu.classList.contains('hidden')) return;
+    if (e.key === 'ArrowDown') { e.preventDefault(); activeIdx = Math.min(activeIdx + 1, items.length - 1); highlight(); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); activeIdx = Math.max(activeIdx - 1, 0); highlight(); }
+    else if (e.key === 'Enter') { if (activeIdx >= 0) { e.preventDefault(); pick(items[activeIdx]); } }
+    else if (e.key === 'Escape') { close(); }
+  });
+  menu.addEventListener('mousedown', e => {
+    const el = e.target.closest('.ac-item');
+    if (!el) return;
+    e.preventDefault();
+    pick(items[Number(el.dataset.i)]);
+  });
+  document.addEventListener('click', e => { if (!wrap.contains(e.target)) close(); });
+}
+
+function setupCustomerAutocompletes() {
+  setupAutocomplete('ord-cust', uniqueCustomerNames, name => {
+    const billing = billingForCustomer(name);
+    if (billing && $('ord-bill') && !$('ord-bill').value) $('ord-bill').value = billing;
+  });
+  setupAutocomplete('ord-bill', uniqueBillingNames);
+  setupAutocomplete('bord-cust', uniqueCustomerNames, name => {
+    const billing = billingForCustomer(name);
+    if (billing && $('bord-bill') && !$('bord-bill').value) $('bord-bill').value = billing;
+  });
+  setupAutocomplete('bord-bill', uniqueBillingNames);
+  setupAutocomplete('ord-filter-cust', uniqueCustomerNames, () => loadOrders());
+  setupAutocomplete('inw-cust', uniqueCustomerNames, () => loadOpenOrderLines());
+  setupAutocomplete('sum-customer', uniqueCustomerNames, () => loadSummary());
 }
 
 async function populateBrandFilteredSkus() {
@@ -923,13 +1020,6 @@ async function loadSummary() {
   };
   const res = (await callGS('api_getOrderSummary', filters)) || { rows: [], byCustomer: [], customers: [] };
   state.lastSummary = res;
-
-  // Populate customer datalist ONLY from actual Orders-sheet names (source of truth).
-  // Skipped when unchanged (see setDatalistHtml) so re-fetching on every keystroke while
-  // typing doesn't reset/close the native autocomplete suggestion popup.
-  if ($('dl-customers')) {
-    setDatalistHtml($('dl-customers'), (res.customers || []).map(c => `<option value="${esc(c)}">`).join(''));
-  }
 
   const tbody = $('tbl-summary-cust').querySelector('tbody');
   tbody.innerHTML = res.byCustomer.map((g, i) => `
