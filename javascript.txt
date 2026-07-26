@@ -44,6 +44,7 @@ function fmtNum(n) { return (Number(n) || 0).toLocaleString(); }
 function fmtSigned(n) { const v = Number(n) || 0; return (v > 0 ? '+' : '') + v.toLocaleString(); }
 function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function todayISO() { return new Date().toISOString().slice(0, 10); }
+function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; }
 
 function rowClass(status) {
   if (status === 'EXCESS' || status === 'OVER SCANNED') return 'diff-excess';
@@ -101,7 +102,15 @@ function onTabShow(tab) {
   else if (tab === 'msl')      { calcMSL(false); loadReorder(); }
   else if (tab === 'orders')   { renderOrderForm(); loadOrders(); }
   else if (tab === 'inward')   { /* no auto-load; user must apply a filter */ }
-  else if (tab === 'summary')  loadSummary();
+  else if (tab === 'summary')  {
+    // Pre-populate customer datalist immediately from cached summary data so suggestions
+    // are available even before the fresh async loadSummary() call resolves.
+    const cached = state.lastSummary?.customers;
+    if (cached && cached.length && $('dl-customers')) {
+      $('dl-customers').innerHTML = cached.map(c => `<option value="${esc(c)}">`).join('');
+    }
+    loadSummary();
+  }
   else if (tab === 'masters')  renderMastersLists();
 }
 
@@ -130,6 +139,22 @@ document.addEventListener('DOMContentLoaded', () => {
     toast('Refreshing…', 'info');
     loadAll();
   });
+
+  // Auto-refresh Order Summary when customer is typed or selected from datalist.
+  // Debounced to avoid excessive server calls while typing.
+  $('sum-customer').addEventListener('input', debounce(loadSummary, 500));
+
+  // Auto-refresh Purchase Orders when customer filter changes.
+  $('ord-filter-cust').addEventListener('input', debounce(loadOrders, 500));
+
+  // Auto-refresh Received Material open-order lines when customer filter changes,
+  // only when at least one filter field is non-empty (mirrors the existing guard in loadOpenOrderLines).
+  $('inw-cust').addEventListener('input', debounce(() => {
+    if ($('inw-from').value || $('inw-to').value || $('inw-cust').value || $('inw-sku').value) {
+      loadOpenOrderLines();
+    }
+  }, 500));
+
   loadAll();
 });
 
@@ -138,10 +163,11 @@ function populateDatalists() {
   const skus = state.masters.skus || [];
   $('dl-skus').innerHTML = skus.map(s =>
     `<option value="${esc(s.SKU)}">${esc(s.Description || '')}</option>`).join('');
-  // Customer datalist is populated from Orders-sheet Col D (source of truth) — see loadSummary().
-  // Only fill it here as a fallback when the Order Summary hasn't been loaded yet.
+  // Customer datalist source of truth is Orders-sheet Col D (see loadSummary()).
+  // Always populate here from masters as a best-effort fallback so suggestions are
+  // available immediately; loadSummary() will overwrite with the definitive set.
   const dl = $('dl-customers');
-  if (dl && !dl.innerHTML) {
+  if (dl) {
     const custs = state.masters.customers || [];
     dl.innerHTML = custs.map(c => `<option value="${esc(c['Customer Name'])}">`).join('');
   }

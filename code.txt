@@ -140,7 +140,8 @@ function normText_(s) {
 /** Strip ALL whitespace + invisible chars + lowercase — used for space-insensitive matching. */
 function normLoose_(s) {
   return String(s == null ? '' : s)
-    .replace(/[\u200B-\u200D\uFEFF\u00A0\s]/g, '')
+    // Strip common invisible/zero-width/format characters and all whitespace
+    .replace(/[\u0000-\u001F\u007F\u00A0\u00AD\u180E\u200B-\u200F\u2028\u2029\u202A-\u202F\u2060-\u2064\u2066-\u206F\uFEFF\uFFF9-\uFFFB\s]/g, '')
     .toLowerCase();
 }
 
