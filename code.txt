@@ -20,7 +20,7 @@ const SHEETS = {
   INWARD:          { name: 'Inward',          headers: ['Date', 'Order ID', 'SKU', 'Qty Received', 'Type'] },
   MISMATCH_REASONS:{ name: 'Mismatch_Reasons',headers: ['Date', 'Type', 'SKU', 'Reason', 'Updated At'] },
   RECEIVED_MATERIAL: { name: 'RECEIVED_MATERIAL', headers: ['Customer Name', 'SKU', 'Quantity', 'Description', 'Quantity Received'] },
-  SUMMARY:           { name: 'Summary',           headers: ['Customer Name', 'SKU', 'QtyOrdered', 'Received', 'Status'] },
+  SUMMARY:           { name: 'Summary',           headers: ['Customer Name', 'SKU', 'QtyOrdered', 'Received', 'Status', 'Billing Name'] },
 };
 
 // ---------- Web app entry ----------
@@ -197,7 +197,7 @@ function rebuildReceivedMaterial_() {
 // ---------- Rebuild Summary sheet ----------
 /**
  * Rebuilds the Summary sheet from the Orders sheet.
- * Aggregates by (Customer Name, SKU): total QtyOrdered, total Received, and a Status label.
+ * Aggregates by (Customer Name, SKU, Billing Name): total QtyOrdered, total Received, and a Status label.
  */
 function rebuildSummary_() {
   const orders = sheetData_(SHEETS.ORDERS.name);
@@ -205,8 +205,9 @@ function rebuildSummary_() {
   orders.forEach(function(o) {
     const customer = String(o['Customer Name'] || '').trim();
     const sku = String(o['SKU'] || '').trim().toUpperCase();
-    const key = customer + '||' + sku;
-    const existing = map.get(key) || { customer: customer, sku: sku, ordered: 0, received: 0 };
+    const billing = String(o['Billing Name'] || '').trim();
+    const key = customer + '||' + sku + '||' + billing;
+    const existing = map.get(key) || { customer: customer, sku: sku, billing: billing, ordered: 0, received: 0 };
     existing.ordered  += Number(o['Qty Ordered'])  || 0;
     existing.received += Number(o['Qty Received']) || 0;
     map.set(key, existing);
@@ -217,7 +218,7 @@ function rebuildSummary_() {
     if (r.ordered === r.received)  status = 'Completely Received';
     else if (r.ordered > r.received) status = 'Partially Received (' + (r.ordered - r.received) + ' pending)';
     else                             status = 'Received More';
-    rows.push([r.customer, r.sku, r.ordered, r.received, status]);
+    rows.push([r.customer, r.sku, r.ordered, r.received, status, r.billing]);
   });
   clearData_(SHEETS.SUMMARY.name);
   if (rows.length) appendRows_(SHEETS.SUMMARY.name, rows);
@@ -705,11 +706,12 @@ function api_placeOrder(payload) {
 
 /**
  * Get orders with filters.
- * filters: { customer, orderOf, status, dateFrom, dateTo, sku }
+ * filters: { customer, billing, orderOf, status, dateFrom, dateTo, sku }
  */
 function api_getOrders(filters) {
   filters = filters || {};
   const cust    = normLoose_(filters.customer);
+  const billing = normLoose_(filters.billing);
   const orderOf = normText_(filters.orderOf);
   const status  = String(filters.status   || '').trim();
   const sku     = normText_(filters.sku).toUpperCase();
@@ -721,6 +723,10 @@ function api_getOrders(filters) {
       const rowCust = normLoose_(o['Customer Name']);
       if (!rowCust) return false;
       if (rowCust.indexOf(cust) < 0 && cust.indexOf(rowCust) < 0) return false;
+    }
+    if (billing) {
+      const rowBilling = normLoose_(o['Billing Name']);
+      if (!rowBilling || (rowBilling.indexOf(billing) < 0 && billing.indexOf(rowBilling) < 0)) return false;
     }
     if (orderOf && normText_(o['Order Of'])       !== orderOf)     return false;
     if (status  && String(o.Status || '').trim() !== status)       return false;
@@ -817,6 +823,18 @@ function api_getOpenOrderLines(filters) {
   }));
 }
 
+function api_getInwardFilterOptions(customer) {
+  const seen = new Set();
+  return api_getOrders({ customer: customer || '' })
+    .map(o => String(o.SKU || '').trim().toUpperCase())
+    .filter(sku => {
+      if (!sku || seen.has(sku)) return false;
+      seen.add(sku);
+      return true;
+    })
+    .sort();
+}
+
 function api_getInwardHistory(filters) {
   filters = filters || {};
   const rows = sheetData_(SHEETS.INWARD.name);
@@ -898,18 +916,42 @@ function api_getOrderCustomers() {
   return customers;
 }
 
+function api_getOrderBillingNames() {
+  const all = sheetData_(SHEETS.ORDERS.name);
+  const seen = new Set();
+  const billingNames = [];
+  all.forEach(function(o) {
+    const raw = String(o['Billing Name'] || '').trim();
+    if (!raw) return;
+    const key = normLoose_(raw);
+    if (seen.has(key)) return;
+    seen.add(key);
+    billingNames.push(raw);
+  });
+  billingNames.sort();
+  return billingNames;
+}
+
 /**
  * Read the Summary sheet, optionally filtered by customer name.
  * Returns [{customerName, sku, qtyOrdered, received, status}].
  */
-function api_getSummaryByCustomer(customer) {
+function api_getSummaryByCustomer(customer, billing) {
+  rebuildSummary_();
   const rows = sheetData_(SHEETS.SUMMARY.name);
   const custNorm = normLoose_(customer || '');
+  const billingNorm = normLoose_(billing || '');
   return rows
     .filter(function(r) {
-      if (!custNorm) return true;
-      const rowCust = normLoose_(r['Customer Name']);
-      return rowCust.indexOf(custNorm) >= 0 || custNorm.indexOf(rowCust) >= 0;
+      if (custNorm) {
+        const rowCust = normLoose_(r['Customer Name']);
+        if (!rowCust || (rowCust.indexOf(custNorm) < 0 && custNorm.indexOf(rowCust) < 0)) return false;
+      }
+      if (billingNorm) {
+        const rowBilling = normLoose_(r['Billing Name']);
+        if (!rowBilling || (rowBilling.indexOf(billingNorm) < 0 && billingNorm.indexOf(rowBilling) < 0)) return false;
+      }
+      return true;
     })
     .map(function(r) {
       return {
@@ -918,6 +960,7 @@ function api_getSummaryByCustomer(customer) {
         qtyOrdered:   Number(r['QtyOrdered']) || 0,
         received:     Number(r['Received'])   || 0,
         status:       String(r['Status'] || ''),
+        billingName:  String(r['Billing Name'] || '').trim(),
       };
     });
 }

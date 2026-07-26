@@ -98,7 +98,7 @@ document.querySelectorAll('.nav-btn').forEach(btn => {
       msl:       ['MSL & Reorder', 'Sales-based MSL suggestion. Edit MSL inline to override.'],
       orders:    ['Purchase Orders', 'Place, upload and filter orders.'],
       inward:    ['Received Material', 'Receive against open orders. Un-ordered receipts flagged.'],
-      summary:   ['Order Summary', 'Filter and expand orders by customer.'],
+      summary:   ['Order Summary', 'Filter summary details by customer, billing name, and order data.'],
       masters:   ['Masters', 'Manage SKUs, brands, order types, customers.'],
     };
     $('page-title').textContent = titles[tab][0];
@@ -114,9 +114,10 @@ function onTabShow(tab) {
   else if (tab === 'compare')  loadComparison();
   else if (tab === 'msl')      { calcMSL(false); loadReorder(); }
   else if (tab === 'orders')   { renderOrderForm(); loadOrders(); }
-  else if (tab === 'inward')   { /* no auto-load; user must apply a filter */ }
+  else if (tab === 'inward')   { populateInwardFilters(); }
   else if (tab === 'summary')  {
     loadSummaryCustomers();
+    loadSummaryBillingNames();
     loadSummary();
   }
   else if (tab === 'masters')  renderMastersLists();
@@ -145,7 +146,7 @@ document.addEventListener('DOMContentLoaded', () => {
   $('btn-upload-inward').addEventListener('click', uploadBulkInward);
   $('btn-refresh').addEventListener('click', () => {
     toast('Refreshing…', 'info');
-    loadAll();
+    resetScreen();
   });
 
   // Refresh Order Summary when a customer is selected from the dropdown.
@@ -154,12 +155,12 @@ document.addEventListener('DOMContentLoaded', () => {
   // Auto-refresh Purchase Orders when customer filter changes.
   $('ord-filter-cust').addEventListener('input', debounce(loadOrders, 500));
 
-  // Auto-refresh Received Material open-order lines when customer filter changes,
-  // only when at least one filter field is non-empty (mirrors the existing guard in loadOpenOrderLines).
-  $('inw-cust').addEventListener('input', debounce(() => {
-    if ($('inw-from').value || $('inw-to').value || $('inw-cust').value || $('inw-sku').value) {
-      loadOpenOrderLines();
-    }
+  $('inw-cust').addEventListener('change', () => {
+    populateInwardSkus();
+    if ($('inw-cust').value) loadOpenOrderLines();
+  });
+  $('inw-sku').addEventListener('input', debounce(() => {
+    if ($('inw-sku').value.trim()) loadOpenOrderLines();
   }, 500));
 
   setupCustomerAutocompletes();
@@ -184,7 +185,42 @@ function populateDatalists() {
       .concat((state.masters.orderTypes || []).map(o => `<option>${esc(o)}</option>`)).join('');
     sumOf.value = prev;
   }
+
+  function resetScreen() {
+    ['inw-from', 'inw-to', 'inw-cust', 'inw-sku', 'ord-from', 'ord-to', 'ord-status',
+     'ord-filter-cust', 'sum-customer', 'sum-billing', 'sum-orderof', 'sum-status', 'sum-from', 'sum-to']
+      .forEach(id => { if ($(id)) $(id).value = ''; });
+    clearInwardFilters();
+    state.pendingItems = [];
+    state.inwardParsed = null;
+    $('inward-preview').textContent = '';
+    $('btn-upload-inward').disabled = true;
+    loadAll();
+  }
+  populateInwardFilters();
   populateBrandFilteredSkus();
+}
+
+function populateInwardFilters() {
+  const customer = $('inw-cust');
+  if (!customer) return;
+  const previous = customer.value;
+  const names = uniqueCustomerNames();
+  customer.innerHTML = '<option value="">All Customers</option>' +
+    names.map(name => `<option value="${esc(name)}">${esc(name)}</option>`).join('');
+  customer.value = names.includes(previous) ? previous : '';
+  populateInwardSkus();
+}
+
+async function populateInwardSkus() {
+  const list = $('dl-inw-skus');
+  if (!list) return;
+  try {
+    const skus = (await callGS('api_getInwardFilterOptions', $('inw-cust').value)) || [];
+    setDatalistHtml(list, skus.map(sku => `<option value="${esc(sku)}"></option>`).join(''));
+  } catch (e) {
+    console.error('populateInwardSkus error:', e);
+  }
 }
 
 /* --------- custom customer/billing autocomplete ---------
@@ -311,7 +347,6 @@ function setupCustomerAutocompletes() {
   // dropdown dispatches an 'input' event above, so those listeners fire without needing
   // a duplicate onSelect callback here.
   setupAutocomplete('ord-filter-cust', uniqueCustomerNames);
-  setupAutocomplete('inw-cust', uniqueCustomerNames);
   // sum-customer is now a <select> populated from Orders column D — no autocomplete needed.
 }
 
@@ -1024,7 +1059,7 @@ async function uploadBulkInward() {
  * ORDER SUMMARY
  * ============================================================ */
 function clearSummaryFilters() {
-  ['sum-customer','sum-orderof','sum-status','sum-from','sum-to'].forEach(id => $(id).value = '');
+  ['sum-customer','sum-billing','sum-orderof','sum-status','sum-from','sum-to'].forEach(id => $(id).value = '');
   loadSummary();
 }
 async function loadSummaryCustomers() {
@@ -1040,68 +1075,37 @@ async function loadSummaryCustomers() {
     console.error('loadSummaryCustomers error:', e);
   }
 }
+async function loadSummaryBillingNames() {
+  try {
+    const names = (await callGS('api_getOrderBillingNames')) || [];
+    const sel = $('sum-billing');
+    const prevVal = sel.value;
+    sel.innerHTML = '<option value="">All Billing Names</option>' +
+      names.map(name => `<option value="${esc(name)}"${name === prevVal ? ' selected' : ''}>${esc(name)}</option>`).join('');
+    if (prevVal && sel.value !== prevVal) sel.value = '';
+  } catch (e) {
+    console.error('loadSummaryBillingNames error:', e);
+  }
+}
 async function loadSummary() {
   const filters = {
     customer: $('sum-customer').value,
+    billing:  $('sum-billing').value,
     orderOf:  $('sum-orderof').value,
     status:   $('sum-status').value,
     dateFrom: $('sum-from').value,
     dateTo:   $('sum-to').value,
   };
-  const res = (await callGS('api_getOrderSummary', filters)) || { rows: [], byCustomer: [], customers: [] };
+  const res = (await callGS('api_getOrderSummary', filters)) || { rows: [] };
   state.lastSummary = res;
-
-  const tbody = $('tbl-summary-cust').querySelector('tbody');
-  tbody.innerHTML = res.byCustomer.map((g, i) => `
-    <tr class="cust-row" data-idx="${i}" style="cursor:pointer">
-      <td><span class="chev">▸</span></td>
-      <td><b>${esc(g.customer)}</b></td>
-      <td class="num">${fmtNum(g.orderIds.length)}</td>
-      <td class="num">${fmtNum(g.lines.length)}</td>
-      <td class="num">${fmtNum(g.totalOrdered)}</td>
-      <td class="num">${fmtNum(g.totalReceived)}</td>
-      <td class="num"><b>${fmtNum(g.totalPending)}</b></td>
-    </tr>
-    <tr class="cust-detail" data-idx="${i}" style="display:none">
-      <td></td>
-      <td colspan="6">
-        <table style="width:100%">
-          <thead><tr><th>Order ID</th><th>Date</th><th>Order Of</th><th>Brand</th><th>SKU</th><th>Ordered</th><th>Received</th><th>Pending</th><th>Status</th></tr></thead>
-          <tbody>
-            ${g.lines.map(l => `<tr>
-              <td class="mono">${esc(l.orderId)}</td>
-              <td class="muted">${esc(l.date)}</td>
-              <td>${esc(l.orderOf)}</td>
-              <td>${esc(l.brand)}</td>
-              <td class="mono">${esc(l.sku)}</td>
-              <td class="num">${fmtNum(l.ordered)}</td>
-              <td class="num">${fmtNum(l.received)}</td>
-              <td class="num"><b>${fmtNum(l.pending)}</b></td>
-              <td>${statusPill(l.status || 'Pending')}</td>
-            </tr>`).join('')}
-          </tbody>
-        </table>
-      </td>
-    </tr>`).join('') || emptyRow(7, 'No customers match. Place an order first, or clear filters.');
-
-  tbody.querySelectorAll('.cust-row').forEach(tr => {
-    tr.addEventListener('click', () => {
-      const idx = tr.dataset.idx;
-      const det = tbody.querySelector(`.cust-detail[data-idx="${idx}"]`);
-      const open = det.style.display !== 'none';
-      det.style.display = open ? 'none' : 'table-row';
-      tr.querySelector('.chev').textContent = open ? '▸' : '▾';
-    });
-  });
-
-  // Also load the Summary sheet view filtered by the selected customer
   loadSummarySheet();
 }
 
 async function loadSummarySheet() {
   const customer = $('sum-customer').value;
+  const billing = $('sum-billing').value;
   try {
-    const rows = (await callGS('api_getSummaryByCustomer', customer)) || [];
+    const rows = (await callGS('api_getSummaryByCustomer', customer, billing)) || [];
     const statusPillSummary = s => {
       if (!s) return '';
       if (s === 'Completely Received') return `<span class="pill ok">${esc(s)}</span>`;
@@ -1116,7 +1120,8 @@ async function loadSummarySheet() {
         <td class="num">${fmtNum(r.qtyOrdered)}</td>
         <td class="num">${fmtNum(r.received)}</td>
         <td>${statusPillSummary(r.status)}</td>
-      </tr>`)      .join('') || emptyRow(5, customer ? `No summary data for "${esc(customer)}".` : 'No summary data. Place an order first.');
+        <td>${esc(r.billingName)}</td>
+      </tr>`).join('') || emptyRow(6, customer || billing ? 'No summary data matches the selected filters.' : 'No summary data. Place an order first.');
   } catch (e) {
     console.error('loadSummarySheet error:', e);
   }
@@ -1124,20 +1129,14 @@ async function loadSummarySheet() {
 
 function downloadSummary() {
   const res = state.lastSummary;
-  if (!res || !res.byCustomer || !res.byCustomer.length) return toast('No data. Apply filters first.', 'err');
+  if (!res || !res.rows || !res.rows.length) return toast('No data. Apply filters first.', 'err');
   const wb = XLSX.utils.book_new();
-  // By Customer sheet
-  const cHeader = ['Customer', 'Orders', 'Lines', 'Total Ordered', 'Total Received', 'Total Pending'];
-  const cData = [cHeader].concat(res.byCustomer.map(g => [
-    g.customer, g.orderIds.length, g.lines.length, g.totalOrdered, g.totalReceived, g.totalPending
+  const lHeader = ['Customer', 'Billing Name', 'Order ID', 'Date', 'Order Of', 'Brand', 'SKU', 'Ordered', 'Received', 'Pending', 'Status'];
+  const lData = [lHeader].concat(res.rows.map(row => [
+    row['Customer Name'], row['Billing Name'], row['Order ID'], row.Date, row['Order Of'], row.Brand,
+    row.SKU, row['Qty Ordered'], row['Qty Received'],
+    (Number(row['Qty Ordered']) || 0) - (Number(row['Qty Received']) || 0), row.Status,
   ]));
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(cData), 'By Customer');
-  // All lines sheet
-  const lHeader = ['Customer', 'Order ID', 'Date', 'Order Of', 'Brand', 'SKU', 'Ordered', 'Received', 'Pending', 'Status'];
-  const lData = [lHeader];
-  res.byCustomer.forEach(g => g.lines.forEach(l => lData.push([
-    g.customer, l.orderId, l.date, l.orderOf, l.brand, l.sku, l.ordered, l.received, l.pending, l.status
-  ])));
   XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(lData), 'Order Lines');
   const filename = `OrderSummary-${todayISO()}.xlsx`;
   XLSX.writeFile(wb, filename);

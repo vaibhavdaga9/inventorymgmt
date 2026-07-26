@@ -48,6 +48,7 @@
       </header>
       <!-- Shared SKU datalist for autocomplete dropdowns -->
       <datalist id="dl-skus"></datalist>
+      <datalist id="dl-inw-skus"></datalist>
       <datalist id="dl-skus-brand"></datalist>
 
       <!-- ============ DASHBOARD ============ -->
@@ -341,10 +342,10 @@
             <div><label>Order From</label><input type="date" id="inw-from"></div>
             <div><label>Order To</label><input type="date" id="inw-to"></div>
             <div><label>Customer</label>
-              <input type="text" id="inw-cust" placeholder="Any customer">
+              <select id="inw-cust"><option value="">All Customers</option></select>
             </div>
             <div><label>SKU</label>
-              <input type="text" id="inw-sku" list="dl-skus" placeholder="Any SKU">
+              <input type="text" id="inw-sku" list="dl-inw-skus" placeholder="Any SKU">
             </div>
             <button class="btn primary" onclick="loadOpenOrderLines()">Apply</button>
             <button class="btn ghost" onclick="clearInwardFilters()">Clear</button>
@@ -379,10 +380,13 @@
       <!-- ============ ORDER SUMMARY ============ -->
       <section id="tab-summary" class="tab">
         <div class="card">
-          <div class="card-head"><h3>Order Summary — By Customer</h3></div>
+          <div class="card-head"><h3>Order Summary</h3></div>
           <div class="filter-bar">
             <div><label>Customer</label>
               <select id="sum-customer"><option value="">All Customers</option></select>
+            </div>
+            <div><label>Billing Name</label>
+              <select id="sum-billing"><option value="">All Billing Names</option></select>
             </div>
             <div><label>Order Of</label><select id="sum-orderof"><option value="">All</option></select></div>
             <div><label>Status</label>
@@ -401,17 +405,10 @@
           </div>
         </div>
         <div class="card">
-          <div class="card-head"><h3>By Customer</h3>
-            <span class="muted">Click a customer row to expand SKUs punched in their orders.</span>
-          </div>
-          <div class="scroll"><table id="tbl-summary-cust"><thead><tr><th></th><th>Customer</th><th>Orders</th><th>Lines</th><th>Ordered</th><th>Received</th><th>Pending</th></tr></thead><tbody></tbody></table></div>
-        </div>
-
-        <div class="card">
           <div class="card-head"><h3>Summary Sheet — SKU-level Status</h3>
-            <span class="muted">Aggregated from the Summary sheet · filtered by the Customer selected above.</span>
+            <span class="muted">Aggregated from the Summary sheet · filter by customer or billing name.</span>
           </div>
-          <div class="scroll"><table id="tbl-summary-sheet"><thead><tr><th>Customer</th><th>SKU</th><th>Qty Ordered</th><th>Received</th><th>Status</th></tr></thead><tbody></tbody></table></div>
+          <div class="scroll"><table id="tbl-summary-sheet"><thead><tr><th>Customer</th><th>SKU</th><th>Qty Ordered</th><th>Received</th><th>Status</th><th>Billing Name</th></tr></thead><tbody></tbody></table></div>
         </div>
       </section>
 
