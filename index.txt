@@ -382,7 +382,7 @@
           <div class="card-head"><h3>Order Summary — By Customer</h3></div>
           <div class="filter-bar">
             <div><label>Customer</label>
-              <input type="text" id="sum-customer" placeholder="Any customer">
+              <select id="sum-customer"><option value="">All Customers</option></select>
             </div>
             <div><label>Order Of</label><select id="sum-orderof"><option value="">All</option></select></div>
             <div><label>Status</label>

@@ -147,9 +147,8 @@ document.addEventListener('DOMContentLoaded', () => {
     loadAll();
   });
 
-  // Auto-refresh Order Summary when customer is typed or selected from datalist.
-  // Debounced to avoid excessive server calls while typing.
-  $('sum-customer').addEventListener('input', debounce(loadSummary, 500));
+  // Refresh Order Summary when a customer is selected from the dropdown.
+  $('sum-customer').addEventListener('change', loadSummary);
 
   // Auto-refresh Purchase Orders when customer filter changes.
   $('ord-filter-cust').addEventListener('input', debounce(loadOrders, 500));
@@ -306,13 +305,13 @@ function setupCustomerAutocompletes() {
     if (billing && $('bord-bill') && !$('bord-bill').value) $('bord-bill').value = billing;
   });
   setupAutocomplete('bord-bill', uniqueBillingNames);
-  // ord-filter-cust, inw-cust and sum-customer already have debounced 'input' listeners
+  // ord-filter-cust and inw-cust already have debounced 'input' listeners
   // (see DOMContentLoaded above) that refresh their respective lists — picking from the
   // dropdown dispatches an 'input' event above, so those listeners fire without needing
   // a duplicate onSelect callback here.
   setupAutocomplete('ord-filter-cust', uniqueCustomerNames);
   setupAutocomplete('inw-cust', uniqueCustomerNames);
-  setupAutocomplete('sum-customer', uniqueCustomerNames);
+  // sum-customer is now a <select> populated from Orders column D — no autocomplete needed.
 }
 
 async function populateBrandFilteredSkus() {
@@ -1037,6 +1036,13 @@ async function loadSummary() {
   };
   const res = (await callGS('api_getOrderSummary', filters)) || { rows: [], byCustomer: [], customers: [] };
   state.lastSummary = res;
+
+  // Repopulate the customer dropdown from unique names in Orders column D.
+  const sel = $('sum-customer');
+  const prevVal = sel.value;
+  sel.innerHTML = '<option value="">All Customers</option>' +
+    (res.customers || []).map(c => `<option value="${esc(c)}"${c === prevVal ? ' selected' : ''}>${esc(c)}</option>`).join('');
+  if (prevVal && sel.value !== prevVal) sel.value = '';
 
   const tbody = $('tbl-summary-cust').querySelector('tbody');
   tbody.innerHTML = res.byCustomer.map((g, i) => `
