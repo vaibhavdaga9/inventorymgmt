@@ -49,7 +49,6 @@
       <!-- Shared SKU datalist for autocomplete dropdowns -->
       <datalist id="dl-skus"></datalist>
       <datalist id="dl-skus-brand"></datalist>
-      <datalist id="dl-skus-brand"></datalist>
 
       <!-- ============ DASHBOARD ============ -->
       <section id="tab-dashboard" class="tab active">

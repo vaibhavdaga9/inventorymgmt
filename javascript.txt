@@ -223,6 +223,9 @@ function billingForCustomer(customerName) {
   return row ? String(row['Billing Name'] || '') : '';
 }
 
+const _acCloseFns = [];
+document.addEventListener('click', e => { _acCloseFns.forEach(fn => fn(e.target)); });
+
 function setupAutocomplete(inputId, getOptions, onSelect) {
   const input = $(inputId);
   if (!input || input._acWired) return;
@@ -279,7 +282,7 @@ function setupAutocomplete(inputId, getOptions, onSelect) {
     e.preventDefault();
     pick(items[Number(el.dataset.i)]);
   });
-  document.addEventListener('click', e => { if (!wrap.contains(e.target)) close(); });
+  _acCloseFns.push(target => { if (!wrap.contains(target)) close(); });
 }
 
 function setupCustomerAutocompletes() {
@@ -293,9 +296,13 @@ function setupCustomerAutocompletes() {
     if (billing && $('bord-bill') && !$('bord-bill').value) $('bord-bill').value = billing;
   });
   setupAutocomplete('bord-bill', uniqueBillingNames);
-  setupAutocomplete('ord-filter-cust', uniqueCustomerNames, () => loadOrders());
-  setupAutocomplete('inw-cust', uniqueCustomerNames, () => loadOpenOrderLines());
-  setupAutocomplete('sum-customer', uniqueCustomerNames, () => loadSummary());
+  // ord-filter-cust, inw-cust and sum-customer already have debounced 'input' listeners
+  // (see DOMContentLoaded above) that refresh their respective lists — picking from the
+  // dropdown dispatches an 'input' event above, so those listeners fire without needing
+  // a duplicate onSelect callback here.
+  setupAutocomplete('ord-filter-cust', uniqueCustomerNames);
+  setupAutocomplete('inw-cust', uniqueCustomerNames);
+  setupAutocomplete('sum-customer', uniqueCustomerNames);
 }
 
 async function populateBrandFilteredSkus() {
