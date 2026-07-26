@@ -168,6 +168,18 @@ document.addEventListener('DOMContentLoaded', () => {
   loadAll();
 });
 
+function resetScreen() {
+  ['inw-from', 'inw-to', 'inw-cust', 'inw-sku', 'ord-from', 'ord-to', 'ord-status',
+   'ord-filter-cust', 'sum-customer', 'sum-billing', 'sum-orderof', 'sum-status', 'sum-from', 'sum-to']
+    .forEach(id => { if ($(id)) $(id).value = ''; });
+  clearInwardFilters();
+  state.pendingItems = [];
+  state.inwardParsed = null;
+  $('inward-preview').textContent = '';
+  $('btn-upload-inward').disabled = true;
+  loadAll();
+}
+
 /* --------- datalists (autocomplete) --------- */
 function populateDatalists() {
   const skus = state.masters.skus || [];
@@ -186,17 +198,6 @@ function populateDatalists() {
     sumOf.value = prev;
   }
 
-  function resetScreen() {
-    ['inw-from', 'inw-to', 'inw-cust', 'inw-sku', 'ord-from', 'ord-to', 'ord-status',
-     'ord-filter-cust', 'sum-customer', 'sum-billing', 'sum-orderof', 'sum-status', 'sum-from', 'sum-to']
-      .forEach(id => { if ($(id)) $(id).value = ''; });
-    clearInwardFilters();
-    state.pendingItems = [];
-    state.inwardParsed = null;
-    $('inward-preview').textContent = '';
-    $('btn-upload-inward').disabled = true;
-    loadAll();
-  }
   populateInwardFilters();
   populateBrandFilteredSkus();
 }
