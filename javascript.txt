@@ -223,6 +223,7 @@ function billingForCustomer(customerName) {
   return row ? String(row['Billing Name'] || '') : '';
 }
 
+const MAX_AUTOCOMPLETE_ITEMS = 50;
 const _acCloseFns = [];
 document.addEventListener('click', e => { _acCloseFns.forEach(fn => fn(e.target)); });
 
@@ -253,7 +254,7 @@ function setupAutocomplete(inputId, getOptions, onSelect) {
   function render() {
     const q = input.value.trim().toLowerCase();
     const all = getOptions();
-    items = (q ? all.filter(c => c.toLowerCase().includes(q)) : all).slice(0, 50);
+    items = (q ? all.filter(c => c.toLowerCase().includes(q)) : all).slice(0, MAX_AUTOCOMPLETE_ITEMS);
     activeIdx = -1;
     if (!items.length) { close(); menu.innerHTML = ''; return; }
     menu.innerHTML = items.map((c, i) => `<div class="ac-item" data-i="${i}">${esc(c)}</div>`).join('');
@@ -271,10 +272,19 @@ function setupAutocomplete(inputId, getOptions, onSelect) {
   input.addEventListener('input', render);
   input.addEventListener('keydown', e => {
     if (menu.classList.contains('hidden')) return;
-    if (e.key === 'ArrowDown') { e.preventDefault(); activeIdx = Math.min(activeIdx + 1, items.length - 1); highlight(); }
-    else if (e.key === 'ArrowUp') { e.preventDefault(); activeIdx = Math.max(activeIdx - 1, 0); highlight(); }
-    else if (e.key === 'Enter') { if (activeIdx >= 0) { e.preventDefault(); pick(items[activeIdx]); } }
-    else if (e.key === 'Escape') { close(); }
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      activeIdx = Math.min(activeIdx + 1, items.length - 1);
+      highlight();
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      activeIdx = Math.max(activeIdx - 1, 0);
+      highlight();
+    } else if (e.key === 'Enter') {
+      if (activeIdx >= 0) { e.preventDefault(); pick(items[activeIdx]); }
+    } else if (e.key === 'Escape') {
+      close();
+    }
   });
   menu.addEventListener('mousedown', e => {
     const el = e.target.closest('.ac-item');
