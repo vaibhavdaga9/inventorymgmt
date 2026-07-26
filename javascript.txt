@@ -1093,6 +1093,33 @@ async function loadSummary() {
       tr.querySelector('.chev').textContent = open ? '▸' : '▾';
     });
   });
+
+  // Also load the Summary sheet view filtered by the selected customer
+  loadSummarySheet();
+}
+
+async function loadSummarySheet() {
+  const customer = $('sum-customer').value;
+  try {
+    const rows = (await callGS('api_getSummaryByCustomer', customer)) || [];
+    const statusPillSummary = s => {
+      if (!s) return '';
+      if (s === 'Completely Received') return `<span class="pill ok">${esc(s)}</span>`;
+      if (s.startsWith('Partially')) return `<span class="pill warn">${esc(s)}</span>`;
+      if (s === 'Received More') return `<span class="pill info">${esc(s)}</span>`;
+      return `<span class="pill">${esc(s)}</span>`;
+    };
+    $('tbl-summary-sheet').querySelector('tbody').innerHTML = rows.map(r => `
+      <tr>
+        <td>${esc(r.customerName)}</td>
+        <td class="mono">${esc(r.sku)}</td>
+        <td class="num">${fmtNum(r.qtyOrdered)}</td>
+        <td class="num">${fmtNum(r.received)}</td>
+        <td>${statusPillSummary(r.status)}</td>
+      </tr>`)      .join('') || emptyRow(5, customer ? `No summary data for "${esc(customer)}".` : 'No summary data. Place an order first.');
+  } catch (e) {
+    console.error('loadSummarySheet error:', e);
+  }
 }
 
 function downloadSummary() {

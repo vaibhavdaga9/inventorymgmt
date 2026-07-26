@@ -19,6 +19,8 @@ const SHEETS = {
   ORDERS:          { name: 'Orders',          headers: ['Order ID', 'Date', 'Order Of', 'Customer Name', 'Billing Name', 'Brand', 'SKU', 'Qty Ordered', 'Description', 'Qty Received', 'Status'] },
   INWARD:          { name: 'Inward',          headers: ['Date', 'Order ID', 'SKU', 'Qty Received', 'Type'] },
   MISMATCH_REASONS:{ name: 'Mismatch_Reasons',headers: ['Date', 'Type', 'SKU', 'Reason', 'Updated At'] },
+  RECEIVED_MATERIAL: { name: 'RECEIVED_MATERIAL', headers: ['Customer Name', 'SKU', 'Quantity', 'Description', 'Quantity Received'] },
+  SUMMARY:           { name: 'Summary',           headers: ['Customer Name', 'SKU', 'QtyOrdered', 'Received', 'Status'] },
 };
 
 // ---------- Web app entry ----------
@@ -172,6 +174,53 @@ function resyncCustomersFromOrders_() {
     .map(c => [c.name, c.billing || '']);
   clearData_(SHEETS.CUSTOMERS.name);
   appendRows_(SHEETS.CUSTOMERS.name, rows);
+}
+
+// ---------- Rebuild RECEIVED_MATERIAL sheet ----------
+/**
+ * Rebuilds the RECEIVED_MATERIAL sheet from the Orders sheet.
+ * One row per order line: Customer Name, SKU, Quantity (ordered), Description, Quantity Received.
+ */
+function rebuildReceivedMaterial_() {
+  const orders = sheetData_(SHEETS.ORDERS.name);
+  const rows = orders.map(o => [
+    String(o['Customer Name'] || '').trim(),
+    String(o['SKU'] || '').trim().toUpperCase(),
+    Number(o['Qty Ordered']) || 0,
+    String(o['Description'] || '').trim(),
+    Number(o['Qty Received']) || 0,
+  ]);
+  clearData_(SHEETS.RECEIVED_MATERIAL.name);
+  if (rows.length) appendRows_(SHEETS.RECEIVED_MATERIAL.name, rows);
+}
+
+// ---------- Rebuild Summary sheet ----------
+/**
+ * Rebuilds the Summary sheet from the Orders sheet.
+ * Aggregates by (Customer Name, SKU): total QtyOrdered, total Received, and a Status label.
+ */
+function rebuildSummary_() {
+  const orders = sheetData_(SHEETS.ORDERS.name);
+  const map = new Map();
+  orders.forEach(function(o) {
+    const customer = String(o['Customer Name'] || '').trim();
+    const sku = String(o['SKU'] || '').trim().toUpperCase();
+    const key = customer + '||' + sku;
+    const existing = map.get(key) || { customer: customer, sku: sku, ordered: 0, received: 0 };
+    existing.ordered  += Number(o['Qty Ordered'])  || 0;
+    existing.received += Number(o['Qty Received']) || 0;
+    map.set(key, existing);
+  });
+  const rows = [];
+  map.forEach(function(r) {
+    var status;
+    if (r.ordered === r.received)  status = 'Completely Received';
+    else if (r.ordered > r.received) status = 'Partially Received (' + (r.ordered - r.received) + ' pending)';
+    else                             status = 'Received More';
+    rows.push([r.customer, r.sku, r.ordered, r.received, status]);
+  });
+  clearData_(SHEETS.SUMMARY.name);
+  if (rows.length) appendRows_(SHEETS.SUMMARY.name, rows);
 }
 
 // ---------- Master data ----------
@@ -649,6 +698,8 @@ function api_placeOrder(payload) {
   ]);
   appendRows_(SHEETS.ORDERS.name, rows);
   if (customer) api_addCustomer(customer, billing);
+  rebuildReceivedMaterial_();
+  rebuildSummary_();
   return { orderId, count: rows.length, date };
 }
 
@@ -698,6 +749,8 @@ function api_receiveInward(orderId, sku, qtyReceived, receivedDate) {
   else status = 'Partial';
   sh.getRange(idx + 2, 10, 1, 2).setValues([[newRec, status]]);
   appendRows_(SHEETS.INWARD.name, [[normDate_(receivedDate) || todayStr_(), orderId, skuU, add, 'Ordered']]);
+  rebuildReceivedMaterial_();
+  rebuildSummary_();
   return { orderId, sku: skuU, newRec, status };
 }
 
@@ -738,6 +791,8 @@ function api_bulkInward(rows, receivedDate) {
       results.push({ orderId: null, sku, taken: 0, status: 'NOT ORDERED', leftover: qty });
     }
   });
+  rebuildReceivedMaterial_();
+  rebuildSummary_();
   return results;
 }
 
@@ -841,6 +896,30 @@ function api_getOrderCustomers() {
   });
   customers.sort();
   return customers;
+}
+
+/**
+ * Read the Summary sheet, optionally filtered by customer name.
+ * Returns [{customerName, sku, qtyOrdered, received, status}].
+ */
+function api_getSummaryByCustomer(customer) {
+  const rows = sheetData_(SHEETS.SUMMARY.name);
+  const custNorm = normLoose_(customer || '');
+  return rows
+    .filter(function(r) {
+      if (!custNorm) return true;
+      const rowCust = normLoose_(r['Customer Name']);
+      return rowCust.indexOf(custNorm) >= 0 || custNorm.indexOf(rowCust) >= 0;
+    })
+    .map(function(r) {
+      return {
+        customerName: String(r['Customer Name'] || '').trim(),
+        sku:          String(r['SKU'] || '').trim().toUpperCase(),
+        qtyOrdered:   Number(r['QtyOrdered']) || 0,
+        received:     Number(r['Received'])   || 0,
+        status:       String(r['Status'] || ''),
+      };
+    });
 }
 
 // ---------- Dashboard ----------

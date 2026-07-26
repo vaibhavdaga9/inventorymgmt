@@ -406,6 +406,13 @@
           </div>
           <div class="scroll"><table id="tbl-summary-cust"><thead><tr><th></th><th>Customer</th><th>Orders</th><th>Lines</th><th>Ordered</th><th>Received</th><th>Pending</th></tr></thead><tbody></tbody></table></div>
         </div>
+
+        <div class="card">
+          <div class="card-head"><h3>Summary Sheet — SKU-level Status</h3>
+            <span class="muted">Aggregated from the Summary sheet · filtered by the Customer selected above.</span>
+          </div>
+          <div class="scroll"><table id="tbl-summary-sheet"><thead><tr><th>Customer</th><th>SKU</th><th>Qty Ordered</th><th>Received</th><th>Status</th></tr></thead><tbody></tbody></table></div>
+        </div>
       </section>
 
       <!-- ============ MASTERS ============ -->
