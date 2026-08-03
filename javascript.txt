@@ -388,7 +388,9 @@ function setupBrandSkuAutocomplete() {
       if (request !== state.brandSkuRequest) return;
       items = rows;
       rows.forEach(item => {
-        state.brandSkuDesc[String(item.sku).trim().toUpperCase()] = item.description || '';
+        if (item.description) {
+          state.brandSkuDesc[String(item.sku).trim().toUpperCase()] = item.description;
+        }
       });
       activeIdx = -1;
       if (!items.length) { menu.innerHTML = ''; close(); return; }
@@ -401,7 +403,12 @@ function setupBrandSkuAutocomplete() {
     }
   }
 
-  input.addEventListener('input', search);
+  const debouncedSearch = debounce(search, 100);
+  input.addEventListener('input', () => {
+    ++state.brandSkuRequest;
+    close();
+    debouncedSearch();
+  });
   input.addEventListener('keydown', e => {
     if (menu.classList.contains('hidden')) return;
     if (e.key === 'ArrowDown') {

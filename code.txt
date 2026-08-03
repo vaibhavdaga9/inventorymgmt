@@ -302,15 +302,18 @@ function brandSheetRows_(brand) {
 function api_searchBrandSkus(brand, query) {
   const needle = String(query || '').trim().toLowerCase();
   if (!needle) return [];
-  const values = brandSheetRows_(brand);
+  const sh = brandSheet_(brand);
+  if (!sh || sh.getLastRow() < 2) return [];
+  const finder = sh.getRange(2, 1, sh.getLastRow() - 1, 1)
+    .createTextFinder(needle)
+    .matchCase(false)
+    .useRegularExpression(false);
   const out = [];
-  for (let i = 0; i < values.length && out.length < 50; i++) {
-    const code = values[i][0];
-    if (!code) continue;
-    const codeStr = String(code).trim();
+  let match;
+  while (out.length < 50 && (match = finder.findNext())) {
+    const codeStr = String(match.getDisplayValue() || '').trim();
     if (!codeStr || /^code$/i.test(codeStr) || /^product/i.test(codeStr)) continue;
-    if (codeStr.toLowerCase().indexOf(needle) < 0) continue;
-    out.push({ sku: codeStr, description: String(values[i][1] || '').trim() });
+    out.push({ sku: codeStr, description: '' });
   }
   return out;
 }
