@@ -280,28 +280,46 @@ function api_addBrand(brand) {
  * Read SKUs directly from a brand-named sheet (e.g. "Jaquar", "Grohe").
  * Expected layout: Col A = Code (SKU), Col B = Product Description.
  * Sheet name match is case-insensitive.
- * Returns [{sku, description}] — up to a soft cap of 5000 rows.
+ * Returns [{sku, description}] for a typed search, capped to keep the web-app
+ * response small even when a brand sheet has tens of thousands of SKUs.
  */
-function api_getBrandSkus(brand) {
-  if (!brand) return [];
+function brandSheet_(brand) {
+  if (!brand) return null;
   const target = String(brand).trim().toLowerCase();
   const configuredBrands = sheetData_(SHEETS.BRANDS.name)
     .map(r => String(r.Brand || '').trim().toLowerCase());
-  if (!configuredBrands.includes(target)) return [];
+  if (!configuredBrands.includes(target)) return null;
   const sheets = ss_().getSheets();
-  const sh = sheets.find(s => s.getName().trim().toLowerCase() === target);
+  return sheets.find(s => s.getName().trim().toLowerCase() === target) || null;
+}
+
+function brandSheetRows_(brand) {
+  const sh = brandSheet_(brand);
   if (!sh || sh.getLastRow() < 2) return [];
-  const rows = Math.min(sh.getLastRow() - 1, 5000);
-  const values = sh.getRange(2, 1, rows, 2).getValues();
+  return sh.getRange(2, 1, sh.getLastRow() - 1, 2).getDisplayValues();
+}
+
+function api_searchBrandSkus(brand, query) {
+  const needle = String(query || '').trim().toLowerCase();
+  if (!needle) return [];
+  const values = brandSheetRows_(brand);
   const out = [];
-  values.forEach(r => {
-    const code = r[0];
-    if (!code) return;
+  for (let i = 0; i < values.length && out.length < 50; i++) {
+    const code = values[i][0];
+    if (!code) continue;
     const codeStr = String(code).trim();
-    if (!codeStr || /^code$/i.test(codeStr) || /^product/i.test(codeStr)) return;
-    out.push({ sku: codeStr, description: String(r[1] || '').trim() });
-  });
+    if (!codeStr || /^code$/i.test(codeStr) || /^product/i.test(codeStr)) continue;
+    if (codeStr.toLowerCase().indexOf(needle) < 0) continue;
+    out.push({ sku: codeStr, description: String(values[i][1] || '').trim() });
+  }
   return out;
+}
+
+function assertBrandSkus_(brand, items) {
+  const validSkus = new Set(brandSheetRows_(brand).map(r => extractSku_(r[0])).filter(Boolean));
+  if (!validSkus.size) throw new Error('No SKU sheet is configured for brand: ' + brand);
+  const invalid = items.map(it => extractSku_(it.sku)).find(sku => !validSkus.has(sku));
+  if (invalid) throw new Error('SKU is not on the selected brand sheet: ' + invalid);
 }
 
 function api_addOrderType(type) {
@@ -695,6 +713,9 @@ function api_placeOrder(payload) {
   const billing = String(payload.billingName || '').trim();
   const items = (payload.items || []).filter(it => extractSku_(it.sku) && Number(it.qty) > 0);
   if (!items.length) throw new Error('No valid items in order');
+  const brands = Array.from(new Set(items.map(it => String(it.brand || '').trim())));
+  if (brands.length !== 1 || !brands[0]) throw new Error('Select one brand for all order items');
+  assertBrandSkus_(brands[0], items);
   const rows = items.map(it => [
     orderId, date, orderOf, customer, billing,
     it.brand || '', extractSku_(it.sku),

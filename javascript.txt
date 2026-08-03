@@ -21,6 +21,7 @@ const state = {
   lastSummary: null,
   activeTab: 'dashboard',
   brandSkuDesc: Object.create(null),
+  brandSkuRequest: 0,
 };
 
 /* --------- helpers --------- */
@@ -348,24 +349,79 @@ function setupCustomerAutocompletes() {
 
 async function populateBrandFilteredSkus() {
   const brand = ($('ord-brand') && $('ord-brand').value || '').trim();
-  const dl = $('dl-skus-brand');
-  if (!dl) return;
   state.brandSkuDesc = Object.create(null);
-  if (!brand) { dl.innerHTML = ''; return; }
-  try {
-    const rows = (await callGS('api_getBrandSkus', brand)) || [];
-    setDatalistHtml(dl, rows.map(r =>
-      `<option value="${esc(r.sku)}">${esc(r.description || '')}</option>`).join(''));
-    rows.forEach(r => { state.brandSkuDesc[String(r.sku).trim().toUpperCase()] = r.description || ''; });
-    if ($('oi-sku')) {
-      $('oi-sku').placeholder = rows.length
-        ? `Start typing SKU (${rows.length} available in ${brand})…`
-        : `No sheet named "${brand}" found — add a sheet with Code + Description columns.`;
-    }
-  } catch (e) {
-    console.error(e);
-    dl.innerHTML = '';
+  if ($('oi-sku')) $('oi-sku').placeholder = brand
+    ? `Start typing SKU from ${brand}…`
+    : 'Select Brand above, then start typing SKU…';
+}
+
+function setupBrandSkuAutocomplete() {
+  const input = $('oi-sku');
+  if (!input || input._brandSkuWired) return;
+  input._brandSkuWired = true;
+  input.removeAttribute('list');
+  input.setAttribute('autocomplete', 'off');
+
+  const wrap = document.createElement('div');
+  wrap.className = 'ac-wrap';
+  input.parentNode.insertBefore(wrap, input);
+  wrap.appendChild(input);
+  const menu = document.createElement('div');
+  menu.className = 'ac-menu hidden';
+  wrap.appendChild(menu);
+  let items = [];
+  let activeIdx = -1;
+
+  function close() { menu.classList.add('hidden'); activeIdx = -1; }
+  function pick(item) {
+    input.value = item.sku;
+    state.brandSkuDesc[String(item.sku).trim().toUpperCase()] = item.description || '';
+    close();
   }
+  async function search() {
+    const brand = String($('ord-brand').value || '').trim();
+    const query = input.value.trim();
+    const request = ++state.brandSkuRequest;
+    if (!brand || !query) { items = []; menu.innerHTML = ''; close(); return; }
+    try {
+      const rows = (await callGS('api_searchBrandSkus', brand, query)) || [];
+      if (request !== state.brandSkuRequest) return;
+      items = rows;
+      activeIdx = -1;
+      if (!items.length) { menu.innerHTML = ''; close(); return; }
+      menu.innerHTML = items.map((item, i) =>
+        `<div class="ac-item" data-i="${i}"><b>${esc(item.sku)}</b>${item.description ? ` — ${esc(item.description)}` : ''}</div>`).join('');
+      menu.classList.remove('hidden');
+    } catch (e) {
+      if (request === state.brandSkuRequest) close();
+      console.error('Brand SKU search failed:', e);
+    }
+  }
+
+  input.addEventListener('input', search);
+  input.addEventListener('keydown', e => {
+    if (menu.classList.contains('hidden')) return;
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      activeIdx = Math.min(activeIdx + 1, items.length - 1);
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      activeIdx = Math.max(activeIdx - 1, 0);
+    } else if (e.key === 'Enter' && activeIdx >= 0) {
+      e.preventDefault();
+      pick(items[activeIdx]);
+    } else if (e.key === 'Escape') {
+      close();
+    }
+    [...menu.children].forEach((el, i) => el.classList.toggle('active', i === activeIdx));
+  });
+  menu.addEventListener('mousedown', e => {
+    const item = e.target.closest('.ac-item');
+    if (!item) return;
+    e.preventDefault();
+    pick(items[Number(item.dataset.i)]);
+  });
+  _acCloseFns.push(target => { if (!wrap.contains(target)) close(); });
 }
 
 /* ============================================================
@@ -812,9 +868,11 @@ function renderOrderForm() {
   populateBrandFilteredSkus();
 
   const oi = $('oi-sku'); const qty = $('oi-qty');
+  setupBrandSkuAutocomplete();
   if (oi && !oi._wired) {
     oi._wired = true;
     oi.addEventListener('keydown', e => {
+      if (e.defaultPrevented) return;
       if (e.key === 'Enter') { e.preventDefault(); qty.focus(); qty.select(); }
     });
   }
