@@ -272,7 +272,10 @@ function api_addBrand(brand) {
   if (!brand) return api_getMasters();
   const sh = ss_().getSheetByName(SHEETS.BRANDS.name);
   const existing = sheetData_(SHEETS.BRANDS.name).map(r => String(r.Brand).toUpperCase());
-  if (!existing.includes(String(brand).toUpperCase())) sh.appendRow([brand]);
+  if (!existing.includes(String(brand).toUpperCase())) {
+    sh.appendRow([brand]);
+    clearBrandSheetCache_();
+  }
   return api_getMasters();
 }
 
@@ -283,14 +286,40 @@ function api_addBrand(brand) {
  * Returns [{sku, description}] for a typed search, capped to keep the web-app
  * response small even when a brand sheet has tens of thousands of SKUs.
  */
+const BRAND_SHEET_CACHE_TTL_SEC = 300; // 5 minutes
+function brandSheetCache_() { return CacheService.getScriptCache(); }
+
+/**
+ * Resolves and caches the sheet name for a brand so repeated lookups (e.g. one
+ * per keystroke while typing a SKU) don't have to re-read the whole Brands
+ * sheet and re-scan every sheet in the spreadsheet each time — that scan was
+ * the main reason the brand/SKU dropdown felt slow.
+ */
 function brandSheet_(brand) {
   if (!brand) return null;
   const target = String(brand).trim().toLowerCase();
+  const cache = brandSheetCache_();
+  const cacheKey = 'brandSheetName_' + target;
+  const cached = cache.get(cacheKey);
+  if (cached !== null) return cached ? ss_().getSheetByName(cached) : null;
+
   const configuredBrands = sheetData_(SHEETS.BRANDS.name)
     .map(r => String(r.Brand || '').trim().toLowerCase());
-  if (!configuredBrands.includes(target)) return null;
+  if (!configuredBrands.includes(target)) {
+    cache.put(cacheKey, '', BRAND_SHEET_CACHE_TTL_SEC);
+    return null;
+  }
   const sheets = ss_().getSheets();
-  return sheets.find(s => s.getName().trim().toLowerCase() === target) || null;
+  const sh = sheets.find(s => s.getName().trim().toLowerCase() === target) || null;
+  cache.put(cacheKey, sh ? sh.getName() : '', BRAND_SHEET_CACHE_TTL_SEC);
+  return sh;
+}
+
+/** Clears the cached brand→sheet resolution (call after brands/sheets change). */
+function clearBrandSheetCache_() {
+  brandSheetCache_().removeAll(
+    sheetData_(SHEETS.BRANDS.name).map(r => 'brandSheetName_' + String(r.Brand || '').trim().toLowerCase())
+  );
 }
 
 function brandSheetRows_(brand) {
