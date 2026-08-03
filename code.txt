@@ -328,10 +328,9 @@ function brandSheetRows_(brand) {
   return sh.getRange(2, 1, sh.getLastRow() - 1, 2).getDisplayValues();
 }
 
-function api_searchBrandSkus(brand, query) {
-  const needle = String(query || '').trim().toLowerCase();
-  if (!needle) return [];
-  const sh = brandSheet_(brand);
+const MAX_BRAND_SKU_RESULTS = 50;
+
+function searchOneBrandSheet_(sh, needle, limit) {
   if (!sh || sh.getLastRow() < 2) return [];
   const finder = sh.getRange(2, 1, sh.getLastRow() - 1, 1)
     .createTextFinder(needle)
@@ -339,10 +338,36 @@ function api_searchBrandSkus(brand, query) {
     .useRegularExpression(false);
   const out = [];
   let match;
-  while (out.length < 50 && (match = finder.findNext())) {
+  while (out.length < limit && (match = finder.findNext())) {
     const codeStr = String(match.getDisplayValue() || '').trim();
     if (!codeStr || /^code$/i.test(codeStr) || /^product/i.test(codeStr)) continue;
-    out.push({ sku: codeStr, description: '' });
+    out.push(codeStr);
+  }
+  return out;
+}
+
+function api_searchBrandSkus(brand, query) {
+  const needle = String(query || '').trim().toLowerCase();
+  if (!needle) return [];
+  const sh = brandSheet_(brand);
+  return searchOneBrandSheet_(sh, needle, MAX_BRAND_SKU_RESULTS).map(codeStr => ({ sku: codeStr, description: '' }));
+}
+
+/**
+ * Searches for a SKU across every configured brand sheet (e.g. Jaquar, Grohe)
+ * so the order-entry SKU field no longer requires picking a Brand first.
+ * Returns [{sku, description, brand}], capped across all brands combined.
+ */
+function api_searchSkusAcrossBrands(query) {
+  const needle = String(query || '').trim().toLowerCase();
+  if (!needle) return [];
+  const brands = sheetData_(SHEETS.BRANDS.name).map(r => String(r.Brand || '').trim()).filter(Boolean);
+  const out = [];
+  for (let i = 0; i < brands.length && out.length < MAX_BRAND_SKU_RESULTS; i++) {
+    const brand = brands[i];
+    const sh = brandSheet_(brand);
+    const matches = searchOneBrandSheet_(sh, needle, MAX_BRAND_SKU_RESULTS - out.length);
+    matches.forEach(codeStr => out.push({ sku: codeStr, description: '', brand }));
   }
   return out;
 }
@@ -354,11 +379,44 @@ function api_findBrandSku(brand, sku) {
   return row ? { sku: String(row[0]).trim(), description: String(row[1] || '').trim() } : null;
 }
 
+/**
+ * Finds a SKU across every configured brand sheet without requiring the
+ * caller to know the brand upfront. Returns the first matching brand's row,
+ * or null if the SKU isn't found on any configured brand sheet.
+ */
+function api_findSkuAcrossBrands(sku) {
+  const target = extractSku_(sku);
+  if (!target) return null;
+  const brands = sheetData_(SHEETS.BRANDS.name).map(r => String(r.Brand || '').trim()).filter(Boolean);
+  for (let i = 0; i < brands.length; i++) {
+    const brand = brands[i];
+    const row = brandSheetRows_(brand).find(r => extractSku_(r[0]) === target);
+    if (row) return { sku: String(row[0]).trim(), description: String(row[1] || '').trim(), brand };
+  }
+  return null;
+}
+
 function assertBrandSkus_(brand, items) {
   const validSkus = new Set(brandSheetRows_(brand).map(r => extractSku_(r[0])).filter(Boolean));
   if (!validSkus.size) throw new Error('No SKU sheet is configured for brand: ' + brand);
   const invalid = items.map(it => extractSku_(it.sku)).find(sku => !validSkus.has(sku));
   if (invalid) throw new Error('SKU is not on the selected brand sheet: ' + invalid);
+}
+
+/**
+ * Validates each item against its own recorded brand (rather than assuming a
+ * single brand for the whole order), so orders can freely mix SKUs from
+ * different brand sheets (e.g. Jaquar + Grohe in one order).
+ */
+function assertItemsOwnBrands_(items) {
+  const byBrand = new Map();
+  items.forEach(it => {
+    const brand = String(it.brand || '').trim();
+    if (!brand) throw new Error('SKU is missing a brand: ' + it.sku);
+    if (!byBrand.has(brand)) byBrand.set(brand, []);
+    byBrand.get(brand).push(it);
+  });
+  byBrand.forEach((brandItems, brand) => assertBrandSkus_(brand, brandItems));
 }
 
 function api_addOrderType(type) {
@@ -752,9 +810,9 @@ function api_placeOrder(payload) {
   const billing = String(payload.billingName || '').trim();
   const items = (payload.items || []).filter(it => extractSku_(it.sku) && Number(it.qty) > 0);
   if (!items.length) throw new Error('No valid items in order');
-  const brands = Array.from(new Set(items.map(it => String(it.brand || '').trim())));
-  if (brands.length !== 1 || !brands[0]) throw new Error('Select one brand for all order items');
-  assertBrandSkus_(brands[0], items);
+  // Each item is validated against its own recorded brand, so a single order
+  // can freely mix SKUs from different brand sheets (e.g. Jaquar + Grohe).
+  assertItemsOwnBrands_(items);
   const rows = items.map(it => [
     orderId, date, orderOf, customer, billing,
     it.brand || '', extractSku_(it.sku),

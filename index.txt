@@ -256,17 +256,10 @@
               <div><label>Billing Name</label>
                 <input type="text" id="ord-bill" placeholder="Type or pick billing name…">
               </div>
-              <div><label>Brand</label>
-                <div class="combo">
-                  <select id="ord-brand"></select>
-                  <input type="text" id="ord-brand-new" placeholder="Add new…">
-                  <button class="btn tiny" onclick="addBrand()">+</button>
-                </div>
-              </div>
             </div>
             <div class="order-adder">
-              <div><label>SKU (type to search — filtered by Brand)</label>
-                <input type="text" id="oi-sku" list="dl-skus-brand" autocomplete="off" placeholder="Select Brand above, then start typing SKU…">
+              <div><label>SKU (type to search — across all brands)</label>
+                <input type="text" id="oi-sku" list="dl-skus-brand" autocomplete="off" placeholder="Start typing SKU (Jaquar, Grohe, …)…">
               </div>
               <div><label>Quantity</label>
                 <input type="number" min="1" value="1" id="oi-qty" onfocus="this.select()">
@@ -278,7 +271,7 @@
                 <b>Pending Items <span class="muted" id="oi-count">(0)</span></b>
                 <button class="btn ghost tiny" onclick="clearPendingItems()">Clear All</button>
               </div>
-              <div class="scroll" style="max-height:220px"><table id="tbl-pending"><thead><tr><th>#</th><th>SKU</th><th>Qty</th><th>Description</th><th></th></tr></thead><tbody></tbody></table></div>
+              <div class="scroll" style="max-height:220px"><table id="tbl-pending"><thead><tr><th>#</th><th>SKU</th><th>Brand</th><th>Qty</th><th>Description</th><th></th></tr></thead><tbody></tbody></table></div>
             </div>
             <div class="right"><button class="btn primary" onclick="placeOrder()">Place Order &amp; Download Excel</button></div>
           </div>

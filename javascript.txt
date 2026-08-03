@@ -196,7 +196,6 @@ function populateDatalists() {
   }
 
   populateInwardFilters();
-  populateBrandFilteredSkus();
 }
 
 function populateInwardFilters() {
@@ -347,14 +346,6 @@ function setupCustomerAutocompletes() {
   setupAutocomplete('ord-filter-cust', uniqueCustomerNames);
 }
 
-async function populateBrandFilteredSkus() {
-  const brand = ($('ord-brand') && $('ord-brand').value || '').trim();
-  state.brandSkuDesc = Object.create(null);
-  if ($('oi-sku')) $('oi-sku').placeholder = brand
-    ? `Start typing SKU from ${brand}…`
-    : 'Select Brand above, then start typing SKU…';
-}
-
 const MAX_BRAND_SKU_ITEMS = 50;
 
 function setupBrandSkuAutocomplete() {
@@ -374,30 +365,31 @@ function setupBrandSkuAutocomplete() {
   let items = [];
   let activeIdx = -1;
 
-  // Per-brand cache of server results keyed by lowercased query, so narrowing
-  // a query the user already searched (e.g. "AB" -> "ABC") can be answered
-  // instantly from previously-fetched rows instead of round-tripping to the
-  // server on every keystroke, which is what made the dropdown feel slow.
-  let cacheBrand = '';
+  // Cache of server results keyed by lowercased query, so narrowing a query
+  // the user already searched (e.g. "AB" -> "ABC") can be answered instantly
+  // from previously-fetched rows instead of round-tripping to the server on
+  // every keystroke, which is what made the dropdown feel slow. The search
+  // itself now spans every configured brand sheet, so a single cache (not
+  // keyed per-brand) is enough.
   let queryCache = new Map();
 
   function close() { menu.classList.add('hidden'); activeIdx = -1; }
   function pick(item) {
     input.value = item.sku;
-    state.brandSkuDesc[String(item.sku).trim().toUpperCase()] = item.description || '';
+    state.brandSkuDesc[String(item.sku).trim().toUpperCase()] = { description: item.description || '', brand: item.brand || '' };
     close();
   }
   function renderItems(rows) {
     items = rows;
     rows.forEach(item => {
-      if (item.description) {
-        state.brandSkuDesc[String(item.sku).trim().toUpperCase()] = item.description;
+      if (item.description || item.brand) {
+        state.brandSkuDesc[String(item.sku).trim().toUpperCase()] = { description: item.description || '', brand: item.brand || '' };
       }
     });
     activeIdx = -1;
     if (!items.length) { menu.innerHTML = ''; close(); return; }
     menu.innerHTML = items.map((item, i) =>
-      `<div class="ac-item" data-i="${i}"><b>${esc(item.sku)}</b>${item.description ? ` — ${esc(item.description)}` : ''}</div>`).join('');
+      `<div class="ac-item" data-i="${i}"><b>${esc(item.sku)}</b>${item.brand ? ` <span class="muted">(${esc(item.brand)})</span>` : ''}${item.description ? ` — ${esc(item.description)}` : ''}</div>`).join('');
     menu.classList.remove('hidden');
   }
   // Finds the longest cached query that is a prefix of `needle` and whose
@@ -415,23 +407,21 @@ function setupBrandSkuAutocomplete() {
   function filterCachedRows(rows, needle) {
     return rows.filter(r => String(r.sku).toLowerCase().includes(needle)).slice(0, MAX_BRAND_SKU_ITEMS);
   }
-  function tryRenderFromCache(brand, needle) {
-    if (brand !== cacheBrand || !needle) return false;
+  function tryRenderFromCache(needle) {
+    if (!needle) return false;
     if (queryCache.has(needle)) { renderItems(queryCache.get(needle)); return true; }
     const base = findCachedBase(needle);
     if (base) { renderItems(filterCachedRows(base.rows, needle)); return true; }
     return false;
   }
   async function search() {
-    const brand = String($('ord-brand').value || '').trim();
     const query = input.value.trim();
-    if (brand !== cacheBrand) { queryCache = new Map(); cacheBrand = brand; }
     const request = ++state.brandSkuRequest;
-    if (!brand || !query) { items = []; menu.innerHTML = ''; close(); return; }
+    if (!query) { items = []; menu.innerHTML = ''; close(); return; }
     const needle = query.toLowerCase();
-    if (tryRenderFromCache(brand, needle)) return;
+    if (tryRenderFromCache(needle)) return;
     try {
-      const rows = (await callGS('api_searchBrandSkus', brand, query)) || [];
+      const rows = (await callGS('api_searchSkusAcrossBrands', query)) || [];
       if (request !== state.brandSkuRequest) return;
       queryCache.set(needle, rows);
       renderItems(rows);
@@ -444,11 +434,10 @@ function setupBrandSkuAutocomplete() {
   const debouncedSearch = debounce(search, 100);
   input.addEventListener('input', () => {
     ++state.brandSkuRequest;
-    const brand = String($('ord-brand').value || '').trim();
     const query = input.value.trim();
     // Render instantly from cache while the debounced server search (a no-op
     // if the cache already answered it) is still pending.
-    if (!query || !tryRenderFromCache(brand, query.toLowerCase())) close();
+    if (!query || !tryRenderFromCache(query.toLowerCase())) close();
     debouncedSearch();
   });
   input.addEventListener('keydown', e => {
@@ -903,21 +892,9 @@ function renderOrderForm() {
   const brandOpts = ['<option value="">— Select —</option>'].concat((state.masters.brands || []).map(b => `<option>${esc(b)}</option>`)).join('');
   const otypeOpts = ['<option value="">— Select —</option>'].concat((state.masters.orderTypes || []).map(b => `<option>${esc(b)}</option>`)).join('');
   $('ord-of').innerHTML = otypeOpts;
-  $('ord-brand').innerHTML = brandOpts;
   $('bord-of').innerHTML = otypeOpts;
   $('bord-brand').innerHTML = brandOpts;
   $('sum-orderof').innerHTML = ['<option value="">All</option>'].concat((state.masters.orderTypes || []).map(o => `<option>${esc(o)}</option>`)).join('');
-
-  const brandSel = $('ord-brand');
-  if (brandSel && !brandSel._wired) {
-    brandSel._wired = true;
-    brandSel.addEventListener('change', () => {
-      populateBrandFilteredSkus();
-      // Clear the SKU input so user starts fresh under the new brand
-      if ($('oi-sku')) $('oi-sku').value = '';
-    });
-  }
-  populateBrandFilteredSkus();
 
   const oi = $('oi-sku'); const qty = $('oi-qty');
   setupBrandSkuAutocomplete();
@@ -942,26 +919,27 @@ async function addPendingItem() {
   const sku = String(skuIn.value || '').trim().toUpperCase();
   const qty = Number(qtyIn.value) || 0;
   if (!sku) { skuIn.focus(); return toast('Enter SKU first.', 'err'); }
-  const brand = $('ord-brand').value;
-  if (!brand) return toast('Select a brand first.', 'err');
-  if (!Object.prototype.hasOwnProperty.call(state.brandSkuDesc, sku)) {
+  let cached = state.brandSkuDesc[sku];
+  if (!cached) {
     try {
-      const item = await callGS('api_findBrandSku', brand, sku);
+      const item = await callGS('api_findSkuAcrossBrands', sku);
       if (!item) {
         skuIn.focus();
-        return toast('Select an SKU from the selected brand list.', 'err');
+        return toast('SKU not found on any brand sheet (Jaquar, Grohe, …).', 'err');
       }
-      state.brandSkuDesc[sku] = item.description || '';
+      cached = { description: item.description || '', brand: item.brand || '' };
+      state.brandSkuDesc[sku] = cached;
     } catch (e) {
       skuIn.focus();
       return toast('SKU lookup failed: ' + e.message, 'err');
     }
   }
   if (qty <= 0) { qtyIn.focus(); qtyIn.select(); return toast('Enter qty > 0.', 'err'); }
-  const desc = (state.brandSkuDesc && state.brandSkuDesc[sku]) || '';
+  const desc = cached.description || '';
+  const brand = cached.brand || '';
   const existing = state.pendingItems.find(x => x.sku === sku);
-  if (existing) { existing.qty += qty; if (!existing.description && desc) existing.description = desc; }
-  else state.pendingItems.push({ sku, qty, description: desc });
+  if (existing) { existing.qty += qty; if (!existing.description && desc) existing.description = desc; if (!existing.brand && brand) existing.brand = brand; }
+  else state.pendingItems.push({ sku, qty, description: desc, brand });
   skuIn.value = ''; qtyIn.value = 1;
   renderPendingItems();
   skuIn.focus();
@@ -975,10 +953,11 @@ function renderPendingItems() {
     <tr>
       <td class="muted">${i + 1}</td>
       <td class="mono">${esc(it.sku)}</td>
+      <td class="muted">${esc(it.brand || '')}</td>
       <td><input type="number" min="1" value="${it.qty}" class="pi-qty" data-idx="${i}" style="width:80px" onfocus="this.select()"></td>
       <td class="muted" style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(it.description || '')}">${esc(it.description || '')}</td>
       <td><button class="btn danger tiny" onclick="deletePendingItem(${i})">×</button></td>
-    </tr>`).join('') : `<tr><td colspan="5" class="muted" style="padding:14px;text-align:center">No items yet.</td></tr>`;
+    </tr>`).join('') : `<tr><td colspan="6" class="muted" style="padding:14px;text-align:center">No items yet.</td></tr>`;
   tbody.querySelectorAll('.pi-qty').forEach(inp => {
     inp.addEventListener('input', e => {
       state.pendingItems[Number(e.target.dataset.idx)].qty = Number(e.target.value) || 0;
@@ -995,12 +974,13 @@ function clearPendingItems() {
 async function placeOrder() {
   const items = state.pendingItems.filter(x => x.sku && x.qty > 0);
   if (!items.length) return toast('Add at least one item.', 'err');
-  const brand = $('ord-brand').value;
+  const missingBrand = items.find(i => !i.brand);
+  if (missingBrand) return toast(`SKU ${missingBrand.sku} is missing a brand — remove and re-add it.`, 'err');
   const payload = {
     orderOf: $('ord-of').value,
     customerName: $('ord-cust').value,
     billingName: $('ord-bill').value,
-    items: items.map(i => ({ sku: i.sku, qty: i.qty, brand, description: i.description || '' })),
+    items: items.map(i => ({ sku: i.sku, qty: i.qty, brand: i.brand, description: i.description || '' })),
   };
   try {
     const r = await callGS('api_placeOrder', payload);
