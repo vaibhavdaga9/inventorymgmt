@@ -315,6 +315,13 @@ function api_searchBrandSkus(brand, query) {
   return out;
 }
 
+function api_findBrandSku(brand, sku) {
+  const target = extractSku_(sku);
+  if (!target) return null;
+  const row = brandSheetRows_(brand).find(r => extractSku_(r[0]) === target);
+  return row ? { sku: String(row[0]).trim(), description: String(row[1] || '').trim() } : null;
+}
+
 function assertBrandSkus_(brand, items) {
   const validSkus = new Set(brandSheetRows_(brand).map(r => extractSku_(r[0])).filter(Boolean));
   if (!validSkus.size) throw new Error('No SKU sheet is configured for brand: ' + brand);

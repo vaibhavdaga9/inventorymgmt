@@ -387,6 +387,9 @@ function setupBrandSkuAutocomplete() {
       const rows = (await callGS('api_searchBrandSkus', brand, query)) || [];
       if (request !== state.brandSkuRequest) return;
       items = rows;
+      rows.forEach(item => {
+        state.brandSkuDesc[String(item.sku).trim().toUpperCase()] = item.description || '';
+      });
       activeIdx = -1;
       if (!items.length) { menu.innerHTML = ''; close(); return; }
       menu.innerHTML = items.map((item, i) =>
@@ -885,15 +888,25 @@ function renderOrderForm() {
   renderPendingItems();
 }
 
-function addPendingItem() {
+async function addPendingItem() {
   const skuIn = $('oi-sku'); const qtyIn = $('oi-qty');
   const sku = String(skuIn.value || '').trim().toUpperCase();
   const qty = Number(qtyIn.value) || 0;
   if (!sku) { skuIn.focus(); return toast('Enter SKU first.', 'err'); }
-  if (!$('ord-brand').value) return toast('Select a brand first.', 'err');
+  const brand = $('ord-brand').value;
+  if (!brand) return toast('Select a brand first.', 'err');
   if (!Object.prototype.hasOwnProperty.call(state.brandSkuDesc, sku)) {
-    skuIn.focus();
-    return toast('Select an SKU from the selected brand list.', 'err');
+    try {
+      const item = await callGS('api_findBrandSku', brand, sku);
+      if (!item) {
+        skuIn.focus();
+        return toast('Select an SKU from the selected brand list.', 'err');
+      }
+      state.brandSkuDesc[sku] = item.description || '';
+    } catch (e) {
+      skuIn.focus();
+      return toast('SKU lookup failed: ' + e.message, 'err');
+    }
   }
   if (qty <= 0) { qtyIn.focus(); qtyIn.select(); return toast('Enter qty > 0.', 'err'); }
   const desc = (state.brandSkuDesc && state.brandSkuDesc[sku]) || '';
