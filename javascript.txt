@@ -344,7 +344,6 @@ function setupCustomerAutocompletes() {
   // dropdown dispatches an 'input' event above, so those listeners fire without needing
   // a duplicate onSelect callback here.
   setupAutocomplete('ord-filter-cust', uniqueCustomerNames);
-  // sum-customer is now a <select> populated from Orders column D — no autocomplete needed.
 }
 
 async function populateBrandFilteredSkus() {
