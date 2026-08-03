@@ -98,7 +98,7 @@ document.querySelectorAll('.nav-btn').forEach(btn => {
       msl:       ['MSL & Reorder', 'Sales-based MSL suggestion. Edit MSL inline to override.'],
       orders:    ['Purchase Orders', 'Place, upload and filter orders.'],
       inward:    ['Received Material', 'Receive against open orders. Un-ordered receipts flagged.'],
-      summary:   ['Order Summary', 'Filter summary details by customer, billing name, and order data.'],
+      summary:   ['Order Summary', 'Filter summary details by billing name and order data.'],
       masters:   ['Masters', 'Manage SKUs, brands, order types, customers.'],
     };
     $('page-title').textContent = titles[tab][0];
@@ -116,7 +116,6 @@ function onTabShow(tab) {
   else if (tab === 'orders')   { renderOrderForm(); loadOrders(); }
   else if (tab === 'inward')   { populateInwardFilters(); }
   else if (tab === 'summary')  {
-    loadSummaryCustomers();
     loadSummaryBillingNames();
     loadSummary();
   }
@@ -149,9 +148,6 @@ document.addEventListener('DOMContentLoaded', () => {
     resetScreen();
   });
 
-  // Refresh Order Summary when a customer is selected from the dropdown.
-  $('sum-customer').addEventListener('change', loadSummary);
-
   // Auto-refresh Purchase Orders when customer filter changes.
   $('ord-filter-cust').addEventListener('input', debounce(loadOrders, 500));
 
@@ -170,7 +166,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
 function resetScreen() {
   ['inw-from', 'inw-to', 'inw-cust', 'inw-sku', 'ord-from', 'ord-to', 'ord-status',
-   'ord-filter-cust', 'sum-customer', 'sum-billing', 'sum-orderof', 'sum-status', 'sum-from', 'sum-to']
+   'ord-filter-cust', 'sum-billing', 'sum-orderof', 'sum-status', 'sum-from', 'sum-to']
     .forEach(id => { if ($(id)) $(id).value = ''; });
   clearInwardFilters();
   state.pendingItems = [];
@@ -1060,21 +1056,8 @@ async function uploadBulkInward() {
  * ORDER SUMMARY
  * ============================================================ */
 function clearSummaryFilters() {
-  ['sum-customer','sum-billing','sum-orderof','sum-status','sum-from','sum-to'].forEach(id => $(id).value = '');
+  ['sum-billing','sum-orderof','sum-status','sum-from','sum-to'].forEach(id => $(id).value = '');
   loadSummary();
-}
-async function loadSummaryCustomers() {
-  try {
-    const names = (await callGS('api_getOrderCustomers')) || [];
-    const sel = $('sum-customer');
-    const prevVal = sel.value;
-    sel.innerHTML = '<option value="">All Customers</option>' +
-      names.map(c => `<option value="${esc(c)}"${c === prevVal ? ' selected' : ''}>${esc(c)}</option>`).join('');
-    // Restore previously selected value if it still exists in the list
-    if (prevVal && sel.value !== prevVal) sel.value = '';
-  } catch (e) {
-    console.error('loadSummaryCustomers error:', e);
-  }
 }
 async function loadSummaryBillingNames() {
   try {
@@ -1090,7 +1073,6 @@ async function loadSummaryBillingNames() {
 }
 async function loadSummary() {
   const filters = {
-    customer: $('sum-customer').value,
     billing:  $('sum-billing').value,
     orderOf:  $('sum-orderof').value,
     status:   $('sum-status').value,
@@ -1103,10 +1085,9 @@ async function loadSummary() {
 }
 
 async function loadSummarySheet() {
-  const customer = $('sum-customer').value;
   const billing = $('sum-billing').value;
   try {
-    const rows = (await callGS('api_getSummaryByCustomer', customer, billing)) || [];
+    const rows = (await callGS('api_getSummaryByCustomer', '', billing)) || [];
     const statusPillSummary = s => {
       if (!s) return '';
       if (s === 'Completely Received') return `<span class="pill ok">${esc(s)}</span>`;
@@ -1122,7 +1103,7 @@ async function loadSummarySheet() {
         <td class="num">${fmtNum(r.received)}</td>
         <td>${statusPillSummary(r.status)}</td>
         <td>${esc(r.billingName)}</td>
-      </tr>`).join('') || emptyRow(6, customer || billing ? 'No summary data matches the selected filters.' : 'No summary data. Place an order first.');
+      </tr>`).join('') || emptyRow(6, billing ? 'No summary data matches the selected filters.' : 'No summary data. Place an order first.');
   } catch (e) {
     console.error('loadSummarySheet error:', e);
   }

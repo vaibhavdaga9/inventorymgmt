@@ -382,9 +382,6 @@
         <div class="card">
           <div class="card-head"><h3>Order Summary</h3></div>
           <div class="filter-bar">
-            <div><label>Customer</label>
-              <select id="sum-customer"><option value="">All Customers</option></select>
-            </div>
             <div><label>Billing Name</label>
               <select id="sum-billing"><option value="">All Billing Names</option></select>
             </div>
@@ -406,7 +403,7 @@
         </div>
         <div class="card">
           <div class="card-head"><h3>Summary Sheet — SKU-level Status</h3>
-            <span class="muted">Aggregated from the Summary sheet · filter by customer or billing name.</span>
+            <span class="muted">Aggregated from the Summary sheet · filter by billing name.</span>
           </div>
           <div class="scroll"><table id="tbl-summary-sheet"><thead><tr><th>Customer</th><th>SKU</th><th>Qty Ordered</th><th>Received</th><th>Status</th><th>Billing Name</th></tr></thead><tbody></tbody></table></div>
         </div>
