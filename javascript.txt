@@ -20,7 +20,7 @@ const state = {
   pendingItems: [],
   lastSummary: null,
   activeTab: 'dashboard',
-  brandSkuDesc: {},
+  brandSkuDesc: Object.create(null),
 };
 
 /* --------- helpers --------- */
@@ -350,7 +350,7 @@ async function populateBrandFilteredSkus() {
   const brand = ($('ord-brand') && $('ord-brand').value || '').trim();
   const dl = $('dl-skus-brand');
   if (!dl) return;
-  state.brandSkuDesc = {};
+  state.brandSkuDesc = Object.create(null);
   if (!brand) { dl.innerHTML = ''; return; }
   try {
     const rows = (await callGS('api_getBrandSkus', brand)) || [];
@@ -832,6 +832,11 @@ function addPendingItem() {
   const sku = String(skuIn.value || '').trim().toUpperCase();
   const qty = Number(qtyIn.value) || 0;
   if (!sku) { skuIn.focus(); return toast('Enter SKU first.', 'err'); }
+  if (!$('ord-brand').value) return toast('Select a brand first.', 'err');
+  if (!Object.prototype.hasOwnProperty.call(state.brandSkuDesc, sku)) {
+    skuIn.focus();
+    return toast('Select an SKU from the selected brand list.', 'err');
+  }
   if (qty <= 0) { qtyIn.focus(); qtyIn.select(); return toast('Enter qty > 0.', 'err'); }
   const desc = (state.brandSkuDesc && state.brandSkuDesc[sku]) || '';
   const existing = state.pendingItems.find(x => x.sku === sku);

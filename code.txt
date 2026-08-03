@@ -285,6 +285,9 @@ function api_addBrand(brand) {
 function api_getBrandSkus(brand) {
   if (!brand) return [];
   const target = String(brand).trim().toLowerCase();
+  const configuredBrands = sheetData_(SHEETS.BRANDS.name)
+    .map(r => String(r.Brand || '').trim().toLowerCase());
+  if (!configuredBrands.includes(target)) return [];
   const sheets = ss_().getSheets();
   const sh = sheets.find(s => s.getName().trim().toLowerCase() === target);
   if (!sh || sh.getLastRow() < 2) return [];
