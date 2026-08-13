@@ -372,6 +372,33 @@ function api_searchSkusAcrossBrands(query) {
   return out;
 }
 
+/**
+ * Preloads every configured brand sheet's SKU + description in one shot so
+ * the client can filter locally on every keystroke (including when the user
+ * starts typing from the middle of a SKU) instead of round-tripping to the
+ * server per keystroke, which is what made suggestions feel slow even though
+ * per-keystroke caching already existed. Capped so an unexpectedly huge
+ * catalog doesn't produce a very large payload; the client falls back to the
+ * per-keystroke server search when the result is truncated.
+ */
+const MAX_PRELOAD_BRAND_SKUS = 20000;
+function api_getAllBrandSkus() {
+  const brands = sheetData_(SHEETS.BRANDS.name).map(r => String(r.Brand || '').trim()).filter(Boolean);
+  const items = [];
+  let truncated = false;
+  for (let i = 0; i < brands.length && !truncated; i++) {
+    const brand = brands[i];
+    const rows = brandSheetRows_(brand);
+    for (let j = 0; j < rows.length; j++) {
+      const codeStr = String(rows[j][0] || '').trim();
+      if (!codeStr || /^code$/i.test(codeStr) || /^product/i.test(codeStr)) continue;
+      if (items.length >= MAX_PRELOAD_BRAND_SKUS) { truncated = true; break; }
+      items.push({ sku: codeStr, description: String(rows[j][1] || '').trim(), brand: brand });
+    }
+  }
+  return { items: items, truncated: truncated };
+}
+
 function api_findBrandSku(brand, sku) {
   const target = extractSku_(sku);
   if (!target) return null;
@@ -1054,36 +1081,43 @@ function api_getOrderBillingNames() {
 }
 
 /**
- * Read the Summary sheet, optionally filtered by customer name.
- * Returns [{customerName, sku, qtyOrdered, received, status}].
+ * Aggregated Order Summary rows for the "Summary Sheet" table, computed live
+ * from the Orders sheet (via api_getOrders) so every filter it supports —
+ * Customer Name, SKU, Billing Name, Order Of, Status, and date range — applies
+ * here too. Grouped by (Customer Name, SKU, Billing Name) so multiple order
+ * lines for the same customer/SKU roll up into one row.
+ * Returns [{customerName, sku, qtyOrdered, received, status, billingName}].
  */
-function api_getSummaryByCustomer(customer, billing) {
-  rebuildSummary_();
-  const rows = sheetData_(SHEETS.SUMMARY.name);
-  const custNorm = normLoose_(customer || '');
-  const billingNorm = normLoose_(billing || '');
-  return rows
-    .filter(function(r) {
-      if (custNorm) {
-        const rowCust = normLoose_(r['Customer Name']);
-        if (!rowCust || (rowCust.indexOf(custNorm) < 0 && custNorm.indexOf(rowCust) < 0)) return false;
-      }
-      if (billingNorm) {
-        const rowBilling = normLoose_(r['Billing Name']);
-        if (!rowBilling || (rowBilling.indexOf(billingNorm) < 0 && billingNorm.indexOf(rowBilling) < 0)) return false;
-      }
-      return true;
-    })
-    .map(function(r) {
+function api_getSummaryByCustomer(filters) {
+  filters = filters || {};
+  const orders = api_getOrders(filters);
+  const map = new Map();
+  orders.forEach(function(o) {
+    const customer = String(o['Customer Name'] || '').trim();
+    const sku = String(o.SKU || '').trim().toUpperCase();
+    const billing = String(o['Billing Name'] || '').trim();
+    const key = customer + '\u0001' + sku + '\u0001' + billing;
+    const g = map.get(key) || { customerName: customer, sku: sku, billingName: billing, qtyOrdered: 0, received: 0 };
+    g.qtyOrdered += Number(o['Qty Ordered']) || 0;
+    g.received   += Number(o['Qty Received']) || 0;
+    map.set(key, g);
+  });
+  return Array.from(map.values())
+    .map(function(g) {
+      let status;
+      if (g.received <= 0) status = 'ALL PENDING';
+      else if (g.received >= g.qtyOrdered) status = 'ALL RECEIVED';
+      else status = 'PENDING PIECES (' + (g.qtyOrdered - g.received) + ')';
       return {
-        customerName: String(r['Customer Name'] || '').trim(),
-        sku:          String(r['SKU'] || '').trim().toUpperCase(),
-        qtyOrdered:   Number(r['QtyOrdered']) || 0,
-        received:     Number(r['Received'])   || 0,
-        status:       String(r['Status'] || ''),
-        billingName:  String(r['Billing Name'] || '').trim(),
+        customerName: g.customerName,
+        sku:          g.sku,
+        qtyOrdered:   g.qtyOrdered,
+        received:     g.received,
+        status:       status,
+        billingName:  g.billingName,
       };
-    });
+    })
+    .sort(function(a, b) { return a.customerName.localeCompare(b.customerName) || a.sku.localeCompare(b.sku); });
 }
 
 // ---------- Dashboard ----------
