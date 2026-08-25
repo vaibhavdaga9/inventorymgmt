@@ -20,7 +20,10 @@ const state = {
   pendingItems: [],
   lastSummary: null,
   activeTab: 'dashboard',
-  brandSkuDesc: {},
+  brandSkuDesc: Object.create(null),
+  brandSkuRequest: 0,
+  brandSkuPreload: null, // null = not loaded yet, [] /array = ready, filtered locally
+  brandSkuPreloadTruncated: false,
 };
 
 /* --------- helpers --------- */
@@ -44,6 +47,20 @@ function fmtNum(n) { return (Number(n) || 0).toLocaleString(); }
 function fmtSigned(n) { const v = Number(n) || 0; return (v > 0 ? '+' : '') + v.toLocaleString(); }
 function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function todayISO() { return new Date().toISOString().slice(0, 10); }
+function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; }
+/**
+ * Rewrite a <datalist>'s options only if the content actually changed.
+ * Browsers close an open native autocomplete popup the instant the backing
+ * <datalist> is mutated — so re-writing it with identical content on every
+ * keystroke (e.g. while an auto-refresh handler re-fetches the same list)
+ * makes suggestions flash and immediately disappear while typing.
+ */
+function setDatalistHtml(dl, html) {
+  if (!dl) return;
+  if (dl._lastHtml === html) return;
+  dl._lastHtml = html;
+  dl.innerHTML = html;
+}
 
 function rowClass(status) {
   if (status === 'EXCESS' || status === 'OVER SCANNED') return 'diff-excess';
@@ -84,7 +101,7 @@ document.querySelectorAll('.nav-btn').forEach(btn => {
       msl:       ['MSL & Reorder', 'Sales-based MSL suggestion. Edit MSL inline to override.'],
       orders:    ['Purchase Orders', 'Place, upload and filter orders.'],
       inward:    ['Received Material', 'Receive against open orders. Un-ordered receipts flagged.'],
-      summary:   ['Order Summary', 'Filter and expand orders by customer.'],
+      summary:   ['Order Summary', 'Filter summary details by billing name and order data.'],
       masters:   ['Masters', 'Manage SKUs, brands, order types, customers.'],
     };
     $('page-title').textContent = titles[tab][0];
@@ -100,8 +117,11 @@ function onTabShow(tab) {
   else if (tab === 'compare')  loadComparison();
   else if (tab === 'msl')      { calcMSL(false); loadReorder(); }
   else if (tab === 'orders')   { renderOrderForm(); loadOrders(); }
-  else if (tab === 'inward')   { /* no auto-load; user must apply a filter */ }
-  else if (tab === 'summary')  loadSummary();
+  else if (tab === 'inward')   { populateInwardFilters(); }
+  else if (tab === 'summary')  {
+    loadSummaryBillingNames();
+    loadSummary();
+  }
   else if (tab === 'masters')  renderMastersLists();
 }
 
@@ -115,6 +135,31 @@ async function loadAll() {
       .forEach(id => { if ($(id) && !$(id).value) $(id).value = todayISO(); });
     onTabShow(state.activeTab);
   } catch (e) { toast('Load failed: ' + e.message, 'err'); }
+  preloadBrandSkus();
+}
+
+/**
+ * Preloads the full Brand SKU catalog (across every configured brand sheet)
+ * once, up front, so the Purchase Order SKU autocomplete can filter entirely
+ * client-side afterwards — including when the user starts typing from the
+ * middle of a SKU, which previously always required a server round trip
+ * (even with per-keystroke caching) and felt slow. Kicked off in parallel
+ * with the rest of the initial load rather than awaited, since the Orders
+ * tab may not be visited immediately.
+ */
+async function preloadBrandSkus() {
+  try {
+    const res = await callGS('api_getAllBrandSkus');
+    if (res && Array.isArray(res.items)) {
+      state.brandSkuPreload = res.items.map(it => ({
+        ...it,
+        _searchLower: String(it.sku).toLowerCase(),
+      }));
+      state.brandSkuPreloadTruncated = !!res.truncated;
+    }
+  } catch (e) {
+    console.error('preloadBrandSkus error:', e);
+  }
 }
 
 document.addEventListener('DOMContentLoaded', () => {
@@ -128,51 +173,379 @@ document.addEventListener('DOMContentLoaded', () => {
   $('btn-upload-inward').addEventListener('click', uploadBulkInward);
   $('btn-refresh').addEventListener('click', () => {
     toast('Refreshing…', 'info');
-    loadAll();
+    resetScreen();
   });
+
+  // Auto-refresh Purchase Orders when customer filter changes.
+  $('ord-filter-cust').addEventListener('input', debounce(loadOrders, 500));
+
+  // Auto-refresh Order Summary when the new Customer Name / SKU filters change.
+  $('sum-customer').addEventListener('input', debounce(loadSummary, 500));
+  $('sum-sku').addEventListener('input', debounce(loadSummary, 500));
+
+  $('inw-cust').addEventListener('change', () => {
+    populateInwardSkus();
+    if ($('inw-cust').value) loadOpenOrderLines();
+  });
+  $('inw-bulk-mode').addEventListener('change', onBulkInwardModeChange);
+  $('inw-sku').addEventListener('input', debounce(() => {
+    if ($('inw-sku').value.trim()) loadOpenOrderLines();
+  }, 500));
+
+  setupCustomerAutocompletes();
+
   loadAll();
 });
+
+function resetScreen() {
+  ['inw-from', 'inw-to', 'inw-cust', 'inw-sku', 'inw-bulk-customer', 'ord-from', 'ord-to', 'ord-status',
+   'ord-filter-cust', 'sum-customer', 'sum-sku', 'sum-billing', 'sum-orderof', 'sum-status', 'sum-from', 'sum-to']
+    .forEach(id => { if ($(id)) $(id).value = ''; });
+  if ($('inw-bulk-mode')) $('inw-bulk-mode').value = 'fifo';
+  onBulkInwardModeChange();
+  clearInwardFilters();
+  state.pendingItems = [];
+  state.inwardParsed = null;
+  $('inward-preview').textContent = '';
+  $('btn-upload-inward').disabled = true;
+  loadAll();
+}
 
 /* --------- datalists (autocomplete) --------- */
 function populateDatalists() {
   const skus = state.masters.skus || [];
-  $('dl-skus').innerHTML = skus.map(s =>
-    `<option value="${esc(s.SKU)}">${esc(s.Description || '')}</option>`).join('');
-  // Customer datalist is populated from Orders-sheet Col D (source of truth) — see loadSummary().
-  // Only fill it here as a fallback when the Order Summary hasn't been loaded yet.
-  const dl = $('dl-customers');
-  if (dl && !dl.innerHTML) {
-    const custs = state.masters.customers || [];
-    dl.innerHTML = custs.map(c => `<option value="${esc(c['Customer Name'])}">`).join('');
+  setDatalistHtml($('dl-skus'), skus.map(s =>
+    `<option value="${esc(s.SKU)}">${esc(s.Description || '')}</option>`).join(''));
+  // Customer/billing suggestions are handled by the custom autocomplete widgets
+  // (see setupCustomerAutocomplete below) which always read live from
+  // state.masters.customers — no datalist population needed here.
+  // "Order Of" filter on the Order Summary tab must be populated as soon as masters load,
+  // not only after the Purchase Orders tab (renderOrderForm) has been visited.
+  const sumOf = $('sum-orderof');
+  if (sumOf) {
+    const prev = sumOf.value;
+    sumOf.innerHTML = ['<option value="">All</option>']
+      .concat((state.masters.orderTypes || []).map(o => `<option>${esc(o)}</option>`)).join('');
+    sumOf.value = prev;
   }
-  const dlBill = $('dl-billings');
-  if (dlBill) {
-    const custs = state.masters.customers || [];
-    dlBill.innerHTML = custs.map(c => `<option value="${esc(c['Billing Name'] || '')}">`).join('');
-  }
-  populateBrandFilteredSkus();
+
+  populateInwardFilters();
 }
 
-async function populateBrandFilteredSkus() {
-  const brand = ($('ord-brand') && $('ord-brand').value || '').trim();
-  const dl = $('dl-skus-brand');
-  if (!dl) return;
-  state.brandSkuDesc = {};
-  if (!brand) { dl.innerHTML = ''; return; }
-  try {
-    const rows = (await callGS('api_getBrandSkus', brand)) || [];
-    dl.innerHTML = rows.map(r =>
-      `<option value="${esc(r.sku)}">${esc(r.description || '')}</option>`).join('');
-    rows.forEach(r => { state.brandSkuDesc[String(r.sku).trim().toUpperCase()] = r.description || ''; });
-    if ($('oi-sku')) {
-      $('oi-sku').placeholder = rows.length
-        ? `Start typing SKU (${rows.length} available in ${brand})…`
-        : `No sheet named "${brand}" found — add a sheet with Code + Description columns.`;
-    }
-  } catch (e) {
-    console.error(e);
-    dl.innerHTML = '';
+function populateInwardFilters() {
+  const customer = $('inw-cust');
+  if (!customer) return;
+  const previous = customer.value;
+  const bulkSel = $('inw-bulk-customer');
+  const bulkPrevious = bulkSel ? bulkSel.value : '';
+  const names = uniqueCustomerNames();
+  customer.innerHTML = '<option value="">All Customers</option>' +
+    names.map(name => `<option value="${esc(name)}">${esc(name)}</option>`).join('');
+  customer.value = names.includes(previous) ? previous : '';
+  if (bulkSel) {
+    bulkSel.innerHTML = '<option value="">Select customer</option>' +
+      names.map(name => `<option value="${esc(name)}">${esc(name)}</option>`).join('');
+    bulkSel.value = names.includes(bulkPrevious) ? bulkPrevious : '';
   }
+  onBulkInwardModeChange();
+  populateInwardSkus();
+}
+
+function onBulkInwardModeChange() {
+  const mode = ($('inw-bulk-mode') && $('inw-bulk-mode').value) || 'fifo';
+  const wrap = $('inw-bulk-customer-wrap');
+  if (!wrap) return;
+  wrap.classList.toggle('hidden', mode !== 'customer');
+}
+
+async function populateInwardSkus() {
+  const list = $('dl-inw-skus');
+  if (!list) return;
+  try {
+    const skus = (await callGS('api_getInwardFilterOptions', $('inw-cust').value)) || [];
+    setDatalistHtml(list, skus.map(sku => `<option value="${esc(sku)}"></option>`).join(''));
+  } catch (e) {
+    console.error('populateInwardSkus error:', e);
+  }
+}
+
+/* --------- custom customer/billing autocomplete ---------
+ * The native <datalist> approach was unreliable in this embedded webapp: the
+ * suggestion popup flashed and closed instantly, and picking a name didn't
+ * reliably populate dependent data. This is a small self-contained dropdown
+ * driven entirely by our own JS/state, so it always shows and a click/Enter
+ * always fires the same events a real datalist selection would.
+ */
+function uniqueCustomerNames() {
+  const seen = new Set(); const out = [];
+  (state.masters.customers || []).forEach(c => {
+    const name = String(c['Customer Name'] || '').trim();
+    if (!name) return;
+    const key = name.toUpperCase();
+    if (seen.has(key)) return;
+    seen.add(key); out.push(name);
+  });
+  return out.sort((a, b) => a.localeCompare(b));
+}
+function uniqueBillingNames() {
+  const seen = new Set(); const out = [];
+  (state.masters.customers || []).forEach(c => {
+    const name = String(c['Billing Name'] || '').trim();
+    if (!name) return;
+    const key = name.toUpperCase();
+    if (seen.has(key)) return;
+    seen.add(key); out.push(name);
+  });
+  return out.sort((a, b) => a.localeCompare(b));
+}
+function billingForCustomer(customerName) {
+  const key = String(customerName || '').trim().toUpperCase();
+  if (!key) return '';
+  const row = (state.masters.customers || []).find(c => String(c['Customer Name'] || '').trim().toUpperCase() === key);
+  return row ? String(row['Billing Name'] || '') : '';
+}
+
+const MAX_AUTOCOMPLETE_ITEMS = 50;
+const _acCloseFns = [];
+document.addEventListener('click', e => { _acCloseFns.forEach(fn => fn(e.target)); });
+
+function setupAutocomplete(inputId, getOptions, onSelect) {
+  const input = $(inputId);
+  if (!input || input._acWired) return;
+  input._acWired = true;
+  input.removeAttribute('list');
+  input.setAttribute('autocomplete', 'off');
+
+  const wrap = document.createElement('div');
+  wrap.className = 'ac-wrap';
+  input.parentNode.insertBefore(wrap, input);
+  wrap.appendChild(input);
+  const menu = document.createElement('div');
+  menu.className = 'ac-menu hidden';
+  wrap.appendChild(menu);
+
+  let items = [];
+  let activeIdx = -1;
+
+  function highlight() {
+    [...menu.children].forEach((el, i) => el.classList.toggle('active', i === activeIdx));
+    const el = menu.children[activeIdx];
+    if (el) el.scrollIntoView({ block: 'nearest' });
+  }
+  function close() { menu.classList.add('hidden'); activeIdx = -1; }
+  function render() {
+    const q = input.value.trim().toLowerCase();
+    const all = getOptions();
+    items = (q ? all.filter(c => c.toLowerCase().includes(q)) : all).slice(0, MAX_AUTOCOMPLETE_ITEMS);
+    activeIdx = -1;
+    if (!items.length) { close(); menu.innerHTML = ''; return; }
+    menu.innerHTML = items.map((c, i) => `<div class="ac-item" data-i="${i}">${esc(c)}</div>`).join('');
+    menu.classList.remove('hidden');
+  }
+  function pick(name) {
+    input.value = name;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    close();
+    if (onSelect) onSelect(name);
+  }
+
+  input.addEventListener('focus', render);
+  input.addEventListener('input', render);
+  input.addEventListener('keydown', e => {
+    if (menu.classList.contains('hidden')) return;
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      activeIdx = Math.min(activeIdx + 1, items.length - 1);
+      highlight();
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      activeIdx = Math.max(activeIdx - 1, 0);
+      highlight();
+    } else if (e.key === 'Enter') {
+      if (activeIdx >= 0) { e.preventDefault(); pick(items[activeIdx]); }
+    } else if (e.key === 'Escape') {
+      close();
+    }
+  });
+  menu.addEventListener('mousedown', e => {
+    const el = e.target.closest('.ac-item');
+    if (!el) return;
+    e.preventDefault();
+    pick(items[Number(el.dataset.i)]);
+  });
+  _acCloseFns.push(target => { if (!wrap.contains(target)) close(); });
+}
+
+function setupCustomerAutocompletes() {
+  setupAutocomplete('ord-cust', uniqueCustomerNames, name => {
+    const billing = billingForCustomer(name);
+    if (billing && $('ord-bill') && !$('ord-bill').value) $('ord-bill').value = billing;
+  });
+  setupAutocomplete('ord-bill', uniqueBillingNames);
+  setupAutocomplete('bord-cust', uniqueCustomerNames, name => {
+    const billing = billingForCustomer(name);
+    if (billing && $('bord-bill') && !$('bord-bill').value) $('bord-bill').value = billing;
+  });
+  setupAutocomplete('bord-bill', uniqueBillingNames);
+  // ord-filter-cust and inw-cust already have debounced 'input' listeners
+  // (see DOMContentLoaded above) that refresh their respective lists — picking from the
+  // dropdown dispatches an 'input' event above, so those listeners fire without needing
+  // a duplicate onSelect callback here.
+  setupAutocomplete('ord-filter-cust', uniqueCustomerNames);
+  // sum-customer has a debounced 'input' listener (see DOMContentLoaded above) that
+  // refreshes Order Summary — picking from the dropdown dispatches an 'input' event,
+  // so that listener fires without needing a duplicate onSelect callback here.
+  setupAutocomplete('sum-customer', uniqueCustomerNames);
+}
+
+const MAX_BRAND_SKU_ITEMS = 50;
+
+function setupBrandSkuAutocomplete() {
+  const input = $('oi-sku');
+  if (!input || input._brandSkuWired) return;
+  input._brandSkuWired = true;
+  input.removeAttribute('list');
+  input.setAttribute('autocomplete', 'off');
+
+  const wrap = document.createElement('div');
+  wrap.className = 'ac-wrap';
+  input.parentNode.insertBefore(wrap, input);
+  wrap.appendChild(input);
+  const menu = document.createElement('div');
+  menu.className = 'ac-menu hidden';
+  wrap.appendChild(menu);
+  let items = [];
+  let activeIdx = -1;
+
+  // Cache of server results keyed by lowercased query, so narrowing a query
+  // the user already searched (e.g. "AB" -> "ABC") can be answered instantly
+  // from previously-fetched rows instead of round-tripping to the server on
+  // every keystroke, which is what made the dropdown feel slow. The search
+  // itself now spans every configured brand sheet, so a single cache (not
+  // keyed per-brand) is enough.
+  let queryCache = new Map();
+  let preloadQueryCache = new Map();
+
+  function close() { menu.classList.add('hidden'); activeIdx = -1; }
+  function pick(item) {
+    input.value = item.sku;
+    state.brandSkuDesc[String(item.sku).trim().toUpperCase()] = { description: item.description || '', brand: item.brand || '' };
+    close();
+  }
+  function renderItems(rows) {
+    items = rows;
+    rows.forEach(item => {
+      if (item.description || item.brand) {
+        state.brandSkuDesc[String(item.sku).trim().toUpperCase()] = { description: item.description || '', brand: item.brand || '' };
+      }
+    });
+    activeIdx = -1;
+    if (!items.length) { menu.innerHTML = ''; close(); return; }
+    menu.innerHTML = items.map((item, i) =>
+      `<div class="ac-item" data-i="${i}"><b>${esc(item.sku)}</b>${item.brand ? ` <span class="muted">(${esc(item.brand)})</span>` : ''}${item.description ? ` — ${esc(item.description)}` : ''}</div>`).join('');
+    menu.classList.remove('hidden');
+  }
+  // Finds the longest cached query that is a prefix of `needle` and whose
+  // cached result set wasn't truncated by the server's cap — only then is it
+  // safe to derive a narrower answer purely by filtering client-side.
+  function findCachedBase(needle) {
+    let best = null;
+    queryCache.forEach((rows, q) => {
+      if (rows.length < MAX_BRAND_SKU_ITEMS && needle.startsWith(q) && (!best || q.length > best.q.length)) {
+        best = { q, rows };
+      }
+    });
+    return best;
+  }
+  function filterCachedRows(rows, needle) {
+    return rows.filter(r => String(r.sku).toLowerCase().includes(needle)).slice(0, MAX_BRAND_SKU_ITEMS);
+  }
+  function tryRenderFromCache(needle) {
+    if (!needle) return false;
+    if (queryCache.has(needle)) { renderItems(queryCache.get(needle)); return true; }
+    const base = findCachedBase(needle);
+    if (base) { renderItems(filterCachedRows(base.rows, needle)); return true; }
+    return false;
+  }
+  async function search() {
+    const query = input.value.trim();
+    const request = ++state.brandSkuRequest;
+    if (!query) { items = []; menu.innerHTML = ''; close(); return; }
+    const needle = query.toLowerCase();
+    // Once the full catalog is preloaded, always answer instantly from it —
+    // this is what makes suggestions fast even starting mid-SKU, since there's
+    // no per-keystroke server round trip at all.
+    if (state.brandSkuPreload) {
+      const local = filterPreloaded(needle);
+      renderItems(local);
+      if (!state.brandSkuPreloadTruncated || local.length >= MAX_BRAND_SKU_ITEMS) return;
+    }
+    if (tryRenderFromCache(needle)) return;
+    try {
+      const rows = (await callGS('api_searchSkusAcrossBrands', query)) || [];
+      if (request !== state.brandSkuRequest) return;
+      queryCache.set(needle, rows);
+      renderItems(rows);
+    } catch (e) {
+      if (request === state.brandSkuRequest) close();
+      console.error('Brand SKU search failed:', e);
+    }
+  }
+  function filterPreloaded(needle) {
+    if (!needle) return [];
+    if (preloadQueryCache.has(needle)) return preloadQueryCache.get(needle);
+    let base = null;
+    preloadQueryCache.forEach((rows, q) => {
+      if (rows.length < MAX_BRAND_SKU_ITEMS && needle.startsWith(q) && (!base || q.length > base.q.length)) base = { q, rows };
+    });
+    const source = base ? base.rows : state.brandSkuPreload;
+    const out = [];
+    for (let i = 0; i < source.length && out.length < MAX_BRAND_SKU_ITEMS; i++) {
+      const item = source[i];
+      if (item._searchLower.includes(needle)) out.push(item);
+    }
+    preloadQueryCache.set(needle, out);
+    return out;
+  }
+
+  const debouncedSearch = debounce(search, 100);
+  input.addEventListener('input', () => {
+    const query = input.value.trim();
+    if (!query) { close(); return; }
+    if (state.brandSkuPreload) {
+      const local = filterPreloaded(query.toLowerCase());
+      renderItems(local);
+      if (!state.brandSkuPreloadTruncated || local.length >= MAX_BRAND_SKU_ITEMS) return;
+    }
+    // Render instantly from cache while the debounced server search (a no-op
+    // if the cache already answered it) is still pending.
+    if (!tryRenderFromCache(query.toLowerCase())) close();
+    debouncedSearch();
+  });
+  input.addEventListener('keydown', e => {
+    if (menu.classList.contains('hidden')) return;
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      activeIdx = Math.min(activeIdx + 1, items.length - 1);
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      activeIdx = Math.max(activeIdx - 1, 0);
+    } else if (e.key === 'Enter' && activeIdx >= 0) {
+      e.preventDefault();
+      pick(items[activeIdx]);
+    } else if (e.key === 'Escape') {
+      close();
+    }
+    [...menu.children].forEach((el, i) => el.classList.toggle('active', i === activeIdx));
+  });
+  menu.addEventListener('mousedown', e => {
+    const item = e.target.closest('.ac-item');
+    if (!item) return;
+    e.preventDefault();
+    pick(items[Number(item.dataset.i)]);
+  });
+  _acCloseFns.push(target => { if (!wrap.contains(target)) close(); });
 }
 
 /* ============================================================
@@ -602,26 +975,16 @@ function renderOrderForm() {
   const brandOpts = ['<option value="">— Select —</option>'].concat((state.masters.brands || []).map(b => `<option>${esc(b)}</option>`)).join('');
   const otypeOpts = ['<option value="">— Select —</option>'].concat((state.masters.orderTypes || []).map(b => `<option>${esc(b)}</option>`)).join('');
   $('ord-of').innerHTML = otypeOpts;
-  $('ord-brand').innerHTML = brandOpts;
   $('bord-of').innerHTML = otypeOpts;
   $('bord-brand').innerHTML = brandOpts;
   $('sum-orderof').innerHTML = ['<option value="">All</option>'].concat((state.masters.orderTypes || []).map(o => `<option>${esc(o)}</option>`)).join('');
 
-  const brandSel = $('ord-brand');
-  if (brandSel && !brandSel._wired) {
-    brandSel._wired = true;
-    brandSel.addEventListener('change', () => {
-      populateBrandFilteredSkus();
-      // Clear the SKU input so user starts fresh under the new brand
-      if ($('oi-sku')) $('oi-sku').value = '';
-    });
-  }
-  populateBrandFilteredSkus();
-
   const oi = $('oi-sku'); const qty = $('oi-qty');
+  setupBrandSkuAutocomplete();
   if (oi && !oi._wired) {
     oi._wired = true;
     oi.addEventListener('keydown', e => {
+      if (e.defaultPrevented) return;
       if (e.key === 'Enter') { e.preventDefault(); qty.focus(); qty.select(); }
     });
   }
@@ -634,16 +997,32 @@ function renderOrderForm() {
   renderPendingItems();
 }
 
-function addPendingItem() {
+async function addPendingItem() {
   const skuIn = $('oi-sku'); const qtyIn = $('oi-qty');
   const sku = String(skuIn.value || '').trim().toUpperCase();
   const qty = Number(qtyIn.value) || 0;
   if (!sku) { skuIn.focus(); return toast('Enter SKU first.', 'err'); }
+  let cached = state.brandSkuDesc[sku];
+  if (!cached) {
+    try {
+      const item = await callGS('api_findSkuAcrossBrands', sku);
+      if (!item) {
+        skuIn.focus();
+        return toast('SKU not found on any brand sheet (Jaquar, Grohe, …).', 'err');
+      }
+      cached = { description: item.description || '', brand: item.brand || '' };
+      state.brandSkuDesc[sku] = cached;
+    } catch (e) {
+      skuIn.focus();
+      return toast('SKU lookup failed: ' + e.message, 'err');
+    }
+  }
   if (qty <= 0) { qtyIn.focus(); qtyIn.select(); return toast('Enter qty > 0.', 'err'); }
-  const desc = (state.brandSkuDesc && state.brandSkuDesc[sku]) || '';
+  const desc = cached.description || '';
+  const brand = cached.brand || '';
   const existing = state.pendingItems.find(x => x.sku === sku);
-  if (existing) { existing.qty += qty; if (!existing.description && desc) existing.description = desc; }
-  else state.pendingItems.push({ sku, qty, description: desc });
+  if (existing) { existing.qty += qty; if (!existing.description && desc) existing.description = desc; if (!existing.brand && brand) existing.brand = brand; }
+  else state.pendingItems.push({ sku, qty, description: desc, brand });
   skuIn.value = ''; qtyIn.value = 1;
   renderPendingItems();
   skuIn.focus();
@@ -657,10 +1036,11 @@ function renderPendingItems() {
     <tr>
       <td class="muted">${i + 1}</td>
       <td class="mono">${esc(it.sku)}</td>
+      <td class="muted">${esc(it.brand || '')}</td>
       <td><input type="number" min="1" value="${it.qty}" class="pi-qty" data-idx="${i}" style="width:80px" onfocus="this.select()"></td>
       <td class="muted" style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(it.description || '')}">${esc(it.description || '')}</td>
       <td><button class="btn danger tiny" onclick="deletePendingItem(${i})">×</button></td>
-    </tr>`).join('') : `<tr><td colspan="5" class="muted" style="padding:14px;text-align:center">No items yet.</td></tr>`;
+    </tr>`).join('') : `<tr><td colspan="6" class="muted" style="padding:14px;text-align:center">No items yet.</td></tr>`;
   tbody.querySelectorAll('.pi-qty').forEach(inp => {
     inp.addEventListener('input', e => {
       state.pendingItems[Number(e.target.dataset.idx)].qty = Number(e.target.value) || 0;
@@ -677,12 +1057,13 @@ function clearPendingItems() {
 async function placeOrder() {
   const items = state.pendingItems.filter(x => x.sku && x.qty > 0);
   if (!items.length) return toast('Add at least one item.', 'err');
-  const brand = $('ord-brand').value;
+  const missingBrand = items.find(i => !i.brand);
+  if (missingBrand) return toast(`SKU ${missingBrand.sku} is missing a brand — remove and re-add it.`, 'err');
   const payload = {
     orderOf: $('ord-of').value,
     customerName: $('ord-cust').value,
     billingName: $('ord-bill').value,
-    items: items.map(i => ({ sku: i.sku, qty: i.qty, brand, description: i.description || '' })),
+    items: items.map(i => ({ sku: i.sku, qty: i.qty, brand: i.brand, description: i.description || '' })),
   };
   try {
     const r = await callGS('api_placeOrder', payload);
@@ -841,11 +1222,14 @@ async function handleInwardFile(file) {
 async function uploadBulkInward() {
   if (!state.inwardParsed || !state.inwardParsed.length) return;
   const d = $('inw-rdate').value || todayISO();
+  const mode = $('inw-bulk-mode').value || 'fifo';
+  const customerName = mode === 'customer' ? $('inw-bulk-customer').value.trim() : '';
+  if (mode === 'customer' && !customerName) return toast('Select a customer for customer-specific bulk inward.', 'err');
   try {
-    const results = await callGS('api_bulkInward', state.inwardParsed, d);
+    const results = await callGS('api_bulkInward', state.inwardParsed, d, customerName);
     const ok = results.filter(r => r.orderId).length;
     const na = results.filter(r => !r.orderId);
-    toast(`${ok} allocated. ${na.length} un-ordered.`, na.length ? 'warn' : 'ok');
+    toast(`${ok} allocated${customerName ? ` for ${customerName}` : ''}. ${na.length} un-ordered.`, na.length ? 'warn' : 'ok');
     $('inward-preview').textContent += '\n\nResult:\n' + results.map(r =>
       r.orderId ? `${r.sku}: ${r.taken} → ${r.orderId} (${r.status})` : `${r.sku}: NOT ORDERED (${r.leftover})`
     ).join('\n');
@@ -862,89 +1246,95 @@ async function uploadBulkInward() {
  * ORDER SUMMARY
  * ============================================================ */
 function clearSummaryFilters() {
-  ['sum-customer','sum-orderof','sum-status','sum-from','sum-to'].forEach(id => $(id).value = '');
+  ['sum-customer','sum-sku','sum-billing','sum-orderof','sum-status','sum-from','sum-to'].forEach(id => $(id).value = '');
   loadSummary();
 }
-async function loadSummary() {
-  const filters = {
+async function loadSummaryBillingNames() {
+  try {
+    const names = (await callGS('api_getOrderBillingNames')) || [];
+    const sel = $('sum-billing');
+    const prevVal = sel.value;
+    sel.innerHTML = '<option value="">All Billing Names</option>' +
+      names.map(name => `<option value="${esc(name)}"${name === prevVal ? ' selected' : ''}>${esc(name)}</option>`).join('');
+    if (prevVal && sel.value !== prevVal) sel.value = '';
+  } catch (e) {
+    console.error('loadSummaryBillingNames error:', e);
+  }
+}
+function summaryFilters() {
+  return {
     customer: $('sum-customer').value,
+    sku:      $('sum-sku').value,
+    billing:  $('sum-billing').value,
     orderOf:  $('sum-orderof').value,
     status:   $('sum-status').value,
     dateFrom: $('sum-from').value,
     dateTo:   $('sum-to').value,
   };
-  const res = (await callGS('api_getOrderSummary', filters)) || { rows: [], byCustomer: [], customers: [] };
-  state.lastSummary = res;
-
-  // Populate customer datalist ONLY from actual Orders-sheet names (source of truth)
-  if ($('dl-customers')) {
-    $('dl-customers').innerHTML = (res.customers || []).map(c => `<option value="${esc(c)}">`).join('');
-  }
-
-  const tbody = $('tbl-summary-cust').querySelector('tbody');
-  tbody.innerHTML = res.byCustomer.map((g, i) => `
-    <tr class="cust-row" data-idx="${i}" style="cursor:pointer">
-      <td><span class="chev">▸</span></td>
-      <td><b>${esc(g.customer)}</b></td>
-      <td class="num">${fmtNum(g.orderIds.length)}</td>
-      <td class="num">${fmtNum(g.lines.length)}</td>
-      <td class="num">${fmtNum(g.totalOrdered)}</td>
-      <td class="num">${fmtNum(g.totalReceived)}</td>
-      <td class="num"><b>${fmtNum(g.totalPending)}</b></td>
-    </tr>
-    <tr class="cust-detail" data-idx="${i}" style="display:none">
-      <td></td>
-      <td colspan="6">
-        <table style="width:100%">
-          <thead><tr><th>Order ID</th><th>Date</th><th>Order Of</th><th>Brand</th><th>SKU</th><th>Ordered</th><th>Received</th><th>Pending</th><th>Status</th></tr></thead>
-          <tbody>
-            ${g.lines.map(l => `<tr>
-              <td class="mono">${esc(l.orderId)}</td>
-              <td class="muted">${esc(l.date)}</td>
-              <td>${esc(l.orderOf)}</td>
-              <td>${esc(l.brand)}</td>
-              <td class="mono">${esc(l.sku)}</td>
-              <td class="num">${fmtNum(l.ordered)}</td>
-              <td class="num">${fmtNum(l.received)}</td>
-              <td class="num"><b>${fmtNum(l.pending)}</b></td>
-              <td>${statusPill(l.status || 'Pending')}</td>
-            </tr>`).join('')}
-          </tbody>
-        </table>
-      </td>
-    </tr>`).join('') || emptyRow(7, 'No customers match. Place an order first, or clear filters.');
-
-  tbody.querySelectorAll('.cust-row').forEach(tr => {
-    tr.addEventListener('click', () => {
-      const idx = tr.dataset.idx;
-      const det = tbody.querySelector(`.cust-detail[data-idx="${idx}"]`);
-      const open = det.style.display !== 'none';
-      det.style.display = open ? 'none' : 'table-row';
-      tr.querySelector('.chev').textContent = open ? '▸' : '▾';
-    });
-  });
 }
 
-function downloadSummary() {
-  const res = state.lastSummary;
-  if (!res || !res.byCustomer || !res.byCustomer.length) return toast('No data. Apply filters first.', 'err');
-  const wb = XLSX.utils.book_new();
-  // By Customer sheet
-  const cHeader = ['Customer', 'Orders', 'Lines', 'Total Ordered', 'Total Received', 'Total Pending'];
-  const cData = [cHeader].concat(res.byCustomer.map(g => [
-    g.customer, g.orderIds.length, g.lines.length, g.totalOrdered, g.totalReceived, g.totalPending
-  ]));
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(cData), 'By Customer');
-  // All lines sheet
-  const lHeader = ['Customer', 'Order ID', 'Date', 'Order Of', 'Brand', 'SKU', 'Ordered', 'Received', 'Pending', 'Status'];
-  const lData = [lHeader];
-  res.byCustomer.forEach(g => g.lines.forEach(l => lData.push([
-    g.customer, l.orderId, l.date, l.orderOf, l.brand, l.sku, l.ordered, l.received, l.pending, l.status
-  ])));
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(lData), 'Order Lines');
-  const filename = `OrderSummary-${todayISO()}.xlsx`;
-  XLSX.writeFile(wb, filename);
-  toast(`Downloaded ${filename}`, 'ok');
+async function loadSummary() {
+  const filters = summaryFilters();
+  const res = (await callGS('api_getOrderSummary', filters)) || { rows: [] };
+  state.lastSummary = res;
+  loadSummarySheet();
+}
+
+/**
+ * Color-codes SKU-level receipt status: nothing received yet is red (ALL
+ * PENDING), everything received is green (ALL RECEIVED), and a partial
+ * receipt is yellow (PENDING PIECES) with the outstanding qty shown.
+ */
+function summaryStatusPill(ordered, received) {
+  const o = Number(ordered) || 0, r = Number(received) || 0;
+  if (r <= 0) return `<span class="pill hot">ALL PENDING</span>`;
+  if (r >= o) return `<span class="pill ok">ALL RECEIVED</span>`;
+  return `<span class="pill warn">PENDING PIECES (${fmtNum(o - r)})</span>`;
+}
+
+async function loadSummarySheet() {
+  const filters = summaryFilters();
+  const hasFilters = Object.values(filters).some(Boolean);
+  try {
+    const rows = (await callGS('api_getSummaryByCustomer', filters)) || [];
+    $('tbl-summary-sheet').querySelector('tbody').innerHTML = rows.map(r => `
+      <tr>
+        <td>${esc(r.customerName)}</td>
+        <td class="mono">${esc(r.sku)}</td>
+        <td class="num">${fmtNum(r.qtyOrdered)}</td>
+        <td class="num">${fmtNum(r.received)}</td>
+        <td>${summaryStatusPill(r.qtyOrdered, r.received)}</td>
+        <td>${esc(r.billingName)}</td>
+      </tr>`).join('') || emptyRow(6, hasFilters ? 'No summary data matches the selected filters.' : 'No summary data. Place an order first.');
+  } catch (e) {
+    console.error('loadSummarySheet error:', e);
+  }
+}
+
+async function downloadSummary() {
+  try {
+    // Always fetch fresh data for the current filters rather than relying on
+    // a possibly-stale/not-yet-loaded state.lastSummary, so the button works
+    // even if clicked right after switching tabs before Apply was clicked.
+    const filters = summaryFilters();
+    const res = (await callGS('api_getOrderSummary', filters)) || { rows: [] };
+    state.lastSummary = res;
+    if (!res.rows || !res.rows.length) return toast('No data to download for the selected filters.', 'err');
+    const wb = XLSX.utils.book_new();
+    const lHeader = ['Customer', 'Billing Name', 'Order ID', 'Date', 'Order Of', 'Brand', 'SKU', 'Ordered', 'Received', 'Pending', 'Status'];
+    const lData = [lHeader].concat(res.rows.map(row => [
+      row['Customer Name'], row['Billing Name'], row['Order ID'], row.Date, row['Order Of'], row.Brand,
+      row.SKU, row['Qty Ordered'], row['Qty Received'],
+      (Number(row['Qty Ordered']) || 0) - (Number(row['Qty Received']) || 0), row.Status,
+    ]));
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(lData), 'Order Lines');
+    const filename = `OrderSummary-${todayISO()}.xlsx`;
+    XLSX.writeFile(wb, filename);
+    toast(`Downloaded ${filename}`, 'ok');
+  } catch (e) {
+    console.error('downloadSummary error:', e);
+    toast('Download failed: ' + e.message, 'err');
+  }
 }
 
 /* ============================================================

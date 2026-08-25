@@ -19,6 +19,8 @@ const SHEETS = {
   ORDERS:          { name: 'Orders',          headers: ['Order ID', 'Date', 'Order Of', 'Customer Name', 'Billing Name', 'Brand', 'SKU', 'Qty Ordered', 'Description', 'Qty Received', 'Status'] },
   INWARD:          { name: 'Inward',          headers: ['Date', 'Order ID', 'SKU', 'Qty Received', 'Type'] },
   MISMATCH_REASONS:{ name: 'Mismatch_Reasons',headers: ['Date', 'Type', 'SKU', 'Reason', 'Updated At'] },
+  RECEIVED_MATERIAL: { name: 'RECEIVED_MATERIAL', headers: ['Customer Name', 'SKU', 'Quantity', 'Description', 'Quantity Received'] },
+  SUMMARY:           { name: 'Summary',           headers: ['Customer Name', 'SKU', 'QtyOrdered', 'Received', 'Status', 'Billing Name'] },
 };
 
 // ---------- Web app entry ----------
@@ -140,13 +142,100 @@ function normText_(s) {
 /** Strip ALL whitespace + invisible chars + lowercase — used for space-insensitive matching. */
 function normLoose_(s) {
   return String(s == null ? '' : s)
-    .replace(/[\u200B-\u200D\uFEFF\u00A0\s]/g, '')
+    // Strip common invisible/zero-width/format characters and all whitespace
+    .replace(/[\u0000-\u001F\u007F\u00A0\u00AD\u180E\u200B-\u200F\u2028\u2029\u202A-\u202F\u2060-\u2064\u2066-\u206F\uFEFF\uFFF9-\uFFFB\s]/g, '')
     .toLowerCase();
+}
+
+/**
+ * Keeps Customers aligned with Orders while preserving manual master additions.
+ * Order-derived customers are upserted into the Customers sheet, but customers
+ * manually added in Masters are not removed.
+ */
+function resyncCustomersFromOrders_() {
+  const existingRows = sheetData_(SHEETS.CUSTOMERS.name);
+  const customerMap = new Map(); // normalised name -> { name, billing }
+  existingRows.forEach(r => {
+    const name = String(r['Customer Name'] || '').trim();
+    if (!name) return;
+    customerMap.set(name.toUpperCase(), {
+      name: name,
+      billing: String(r['Billing Name'] || '').trim(),
+    });
+  });
+
+  const orders = sheetData_(SHEETS.ORDERS.name);
+  orders.forEach(o => {
+    const name = String(o['Customer Name'] || '').trim();
+    if (!name) return;
+    const key = name.toUpperCase();
+    const billing = String(o['Billing Name'] || '').trim();
+    const existing = customerMap.get(key);
+    if (!existing) {
+      customerMap.set(key, { name, billing });
+    } else if (billing && !existing.billing) {
+      existing.billing = billing;
+    }
+  });
+  const rows = Array.from(customerMap.values())
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .map(c => [c.name, c.billing || '']);
+  clearData_(SHEETS.CUSTOMERS.name);
+  if (rows.length) appendRows_(SHEETS.CUSTOMERS.name, rows);
+}
+
+// ---------- Rebuild RECEIVED_MATERIAL sheet ----------
+/**
+ * Rebuilds the RECEIVED_MATERIAL sheet from the Orders sheet.
+ * One row per order line: Customer Name, SKU, Quantity (ordered), Description, Quantity Received.
+ */
+function rebuildReceivedMaterial_() {
+  const orders = sheetData_(SHEETS.ORDERS.name);
+  const rows = orders.map(o => [
+    String(o['Customer Name'] || '').trim(),
+    String(o['SKU'] || '').trim().toUpperCase(),
+    Number(o['Qty Ordered']) || 0,
+    String(o['Description'] || '').trim(),
+    Number(o['Qty Received']) || 0,
+  ]);
+  clearData_(SHEETS.RECEIVED_MATERIAL.name);
+  if (rows.length) appendRows_(SHEETS.RECEIVED_MATERIAL.name, rows);
+}
+
+// ---------- Rebuild Summary sheet ----------
+/**
+ * Rebuilds the Summary sheet from the Orders sheet.
+ * Aggregates by (Customer Name, SKU, Billing Name): total QtyOrdered, total Received, and a Status label.
+ */
+function rebuildSummary_() {
+  const orders = sheetData_(SHEETS.ORDERS.name);
+  const map = new Map();
+  orders.forEach(function(o) {
+    const customer = String(o['Customer Name'] || '').trim();
+    const sku = String(o['SKU'] || '').trim().toUpperCase();
+    const billing = String(o['Billing Name'] || '').trim();
+    const key = JSON.stringify([customer, sku, billing]);
+    const existing = map.get(key) || { customer: customer, sku: sku, billing: billing, ordered: 0, received: 0 };
+    existing.ordered  += Number(o['Qty Ordered'])  || 0;
+    existing.received += Number(o['Qty Received']) || 0;
+    map.set(key, existing);
+  });
+  const rows = [];
+  map.forEach(function(r) {
+    let status;
+    if (r.ordered === r.received)  status = 'Completely Received';
+    else if (r.ordered > r.received) status = 'Partially Received (' + (r.ordered - r.received) + ' pending)';
+    else                             status = 'Received More';
+    rows.push([r.customer, r.sku, r.ordered, r.received, status, r.billing]);
+  });
+  clearData_(SHEETS.SUMMARY.name);
+  if (rows.length) appendRows_(SHEETS.SUMMARY.name, rows);
 }
 
 // ---------- Master data ----------
 function api_getMasters() {
   ensureAllSheets_();
+  resyncCustomersFromOrders_();
   return {
     skus:       sheetData_(SHEETS.SKU_MASTER.name),
     brands:     sheetData_(SHEETS.BRANDS.name).map(r => r.Brand).filter(Boolean),
@@ -191,7 +280,10 @@ function api_addBrand(brand) {
   if (!brand) return api_getMasters();
   const sh = ss_().getSheetByName(SHEETS.BRANDS.name);
   const existing = sheetData_(SHEETS.BRANDS.name).map(r => String(r.Brand).toUpperCase());
-  if (!existing.includes(String(brand).toUpperCase())) sh.appendRow([brand]);
+  if (!existing.includes(String(brand).toUpperCase())) {
+    sh.appendRow([brand]);
+    clearBrandSheetCache_();
+  }
   return api_getMasters();
 }
 
@@ -199,25 +291,167 @@ function api_addBrand(brand) {
  * Read SKUs directly from a brand-named sheet (e.g. "Jaquar", "Grohe").
  * Expected layout: Col A = Code (SKU), Col B = Product Description.
  * Sheet name match is case-insensitive.
- * Returns [{sku, description}] — up to a soft cap of 5000 rows.
+ * Returns [{sku, description}] for a typed search, capped to keep the web-app
+ * response small even when a brand sheet has tens of thousands of SKUs.
  */
-function api_getBrandSkus(brand) {
-  if (!brand) return [];
+const BRAND_SHEET_CACHE_TTL_SEC = 300; // 5 minutes
+function brandSheetCache_() { return CacheService.getScriptCache(); }
+
+/**
+ * Resolves and caches the sheet name for a brand so repeated lookups (e.g. one
+ * per keystroke while typing a SKU) don't have to re-read the whole Brands
+ * sheet and re-scan every sheet in the spreadsheet each time — that scan was
+ * the main reason the brand/SKU dropdown felt slow.
+ */
+function brandSheet_(brand) {
+  if (!brand) return null;
   const target = String(brand).trim().toLowerCase();
+  const cache = brandSheetCache_();
+  const cacheKey = 'brandSheetName_' + target;
+  const cached = cache.get(cacheKey);
+  if (cached !== null) return cached ? ss_().getSheetByName(cached) : null;
+
+  const configuredBrands = sheetData_(SHEETS.BRANDS.name)
+    .map(r => String(r.Brand || '').trim().toLowerCase());
+  if (!configuredBrands.includes(target)) {
+    cache.put(cacheKey, '', BRAND_SHEET_CACHE_TTL_SEC);
+    return null;
+  }
   const sheets = ss_().getSheets();
-  const sh = sheets.find(s => s.getName().trim().toLowerCase() === target);
+  const sh = sheets.find(s => s.getName().trim().toLowerCase() === target) || null;
+  cache.put(cacheKey, sh ? sh.getName() : '', BRAND_SHEET_CACHE_TTL_SEC);
+  return sh;
+}
+
+/** Clears the cached brand→sheet resolution (call after brands/sheets change). */
+function clearBrandSheetCache_() {
+  brandSheetCache_().removeAll(
+    sheetData_(SHEETS.BRANDS.name).map(r => 'brandSheetName_' + String(r.Brand || '').trim().toLowerCase())
+  );
+}
+
+function brandSheetRows_(brand) {
+  const sh = brandSheet_(brand);
   if (!sh || sh.getLastRow() < 2) return [];
-  const rows = Math.min(sh.getLastRow() - 1, 5000);
-  const values = sh.getRange(2, 1, rows, 2).getValues();
+  return sh.getRange(2, 1, sh.getLastRow() - 1, 2).getDisplayValues();
+}
+
+const MAX_BRAND_SKU_RESULTS = 50;
+
+function searchOneBrandSheet_(sh, needle, limit) {
+  if (!sh || sh.getLastRow() < 2) return [];
+  const finder = sh.getRange(2, 1, sh.getLastRow() - 1, 1)
+    .createTextFinder(needle)
+    .matchCase(false)
+    .useRegularExpression(false);
   const out = [];
-  values.forEach(r => {
-    const code = r[0];
-    if (!code) return;
-    const codeStr = String(code).trim();
-    if (!codeStr || /^code$/i.test(codeStr) || /^product/i.test(codeStr)) return;
-    out.push({ sku: codeStr, description: String(r[1] || '').trim() });
-  });
+  let match;
+  while (out.length < limit && (match = finder.findNext())) {
+    const codeStr = String(match.getDisplayValue() || '').trim();
+    if (!codeStr || /^code$/i.test(codeStr) || /^product/i.test(codeStr)) continue;
+    out.push(codeStr);
+  }
   return out;
+}
+
+function api_searchBrandSkus(brand, query) {
+  const needle = String(query || '').trim().toLowerCase();
+  if (!needle) return [];
+  const sh = brandSheet_(brand);
+  return searchOneBrandSheet_(sh, needle, MAX_BRAND_SKU_RESULTS).map(codeStr => ({ sku: codeStr, description: '' }));
+}
+
+/**
+ * Searches for a SKU across every configured brand sheet (e.g. Jaquar, Grohe)
+ * so the order-entry SKU field no longer requires picking a Brand first.
+ * Returns [{sku, description, brand}], capped across all brands combined.
+ */
+function api_searchSkusAcrossBrands(query) {
+  const needle = String(query || '').trim().toLowerCase();
+  if (!needle) return [];
+  const brands = sheetData_(SHEETS.BRANDS.name).map(r => String(r.Brand || '').trim()).filter(Boolean);
+  const out = [];
+  for (let i = 0; i < brands.length && out.length < MAX_BRAND_SKU_RESULTS; i++) {
+    const brand = brands[i];
+    const sh = brandSheet_(brand);
+    const matches = searchOneBrandSheet_(sh, needle, MAX_BRAND_SKU_RESULTS - out.length);
+    matches.forEach(codeStr => out.push({ sku: codeStr, description: '', brand }));
+  }
+  return out;
+}
+
+/**
+ * Preloads every configured brand sheet's SKU + description in one shot so
+ * the client can filter locally on every keystroke (including when the user
+ * starts typing from the middle of a SKU) instead of round-tripping to the
+ * server per keystroke, which is what made suggestions feel slow even though
+ * per-keystroke caching already existed. Capped so an unexpectedly huge
+ * catalog doesn't produce a very large payload; the client falls back to the
+ * per-keystroke server search when the result is truncated.
+ */
+const MAX_PRELOAD_BRAND_SKUS = 20000;
+function api_getAllBrandSkus() {
+  const brands = sheetData_(SHEETS.BRANDS.name).map(r => String(r.Brand || '').trim()).filter(Boolean);
+  const items = [];
+  let truncated = false;
+  for (let i = 0; i < brands.length && !truncated; i++) {
+    const brand = brands[i];
+    const rows = brandSheetRows_(brand);
+    for (let j = 0; j < rows.length; j++) {
+      const codeStr = String(rows[j][0] || '').trim();
+      if (!codeStr || /^code$/i.test(codeStr) || /^product/i.test(codeStr)) continue;
+      if (items.length >= MAX_PRELOAD_BRAND_SKUS) { truncated = true; break; }
+      items.push({ sku: codeStr, description: String(rows[j][1] || '').trim(), brand: brand });
+    }
+  }
+  return { items: items, truncated: truncated };
+}
+
+function api_findBrandSku(brand, sku) {
+  const target = extractSku_(sku);
+  if (!target) return null;
+  const row = brandSheetRows_(brand).find(r => extractSku_(r[0]) === target);
+  return row ? { sku: String(row[0]).trim(), description: String(row[1] || '').trim() } : null;
+}
+
+/**
+ * Finds a SKU across every configured brand sheet without requiring the
+ * caller to know the brand upfront. Returns the first matching brand's row,
+ * or null if the SKU isn't found on any configured brand sheet.
+ */
+function api_findSkuAcrossBrands(sku) {
+  const target = extractSku_(sku);
+  if (!target) return null;
+  const brands = sheetData_(SHEETS.BRANDS.name).map(r => String(r.Brand || '').trim()).filter(Boolean);
+  for (let i = 0; i < brands.length; i++) {
+    const brand = brands[i];
+    const row = brandSheetRows_(brand).find(r => extractSku_(r[0]) === target);
+    if (row) return { sku: String(row[0]).trim(), description: String(row[1] || '').trim(), brand };
+  }
+  return null;
+}
+
+function assertBrandSkus_(brand, items) {
+  const validSkus = new Set(brandSheetRows_(brand).map(r => extractSku_(r[0])).filter(Boolean));
+  if (!validSkus.size) throw new Error('No SKU sheet is configured for brand: ' + brand);
+  const invalid = items.map(it => extractSku_(it.sku)).find(sku => !validSkus.has(sku));
+  if (invalid) throw new Error('SKU is not on the selected brand sheet: ' + invalid);
+}
+
+/**
+ * Validates each item against its own recorded brand (rather than assuming a
+ * single brand for the whole order), so orders can freely mix SKUs from
+ * different brand sheets (e.g. Jaquar + Grohe in one order).
+ */
+function assertItemsOwnBrands_(items) {
+  const byBrand = new Map();
+  items.forEach(it => {
+    const brand = String(it.brand || '').trim();
+    if (!brand) throw new Error('SKU is missing a brand: ' + it.sku);
+    if (!byBrand.has(brand)) byBrand.set(brand, []);
+    byBrand.get(brand).push(it);
+  });
+  byBrand.forEach((brandItems, brand) => assertBrandSkus_(brand, brandItems));
 }
 
 function api_addOrderType(type) {
@@ -234,9 +468,13 @@ function api_addCustomer(customer, billing) {
   const existing = sheetData_(SHEETS.CUSTOMERS.name);
   const idx = existing.findIndex(r => String(r['Customer Name']).toUpperCase() === String(customer).toUpperCase());
   if (idx >= 0) {
-    if (billing) sh.getRange(idx + 2, 2).setValue(billing);
+    const currentName = String(existing[idx]['Customer Name'] || '').trim();
+    const currentBilling = String(existing[idx]['Billing Name'] || '').trim();
+    const nextName = String(customer).trim() || currentName;
+    const nextBilling = String(billing || '').trim() || currentBilling;
+    sh.getRange(idx + 2, 1, 1, 2).setValues([[nextName, nextBilling]]);
   } else {
-    sh.appendRow([customer, billing || '']);
+    sh.appendRow([String(customer).trim(), String(billing || '').trim()]);
   }
   return api_getMasters();
 }
@@ -611,6 +849,9 @@ function api_placeOrder(payload) {
   const billing = String(payload.billingName || '').trim();
   const items = (payload.items || []).filter(it => extractSku_(it.sku) && Number(it.qty) > 0);
   if (!items.length) throw new Error('No valid items in order');
+  // Each item is validated against its own recorded brand, so a single order
+  // can freely mix SKUs from different brand sheets (e.g. Jaquar + Grohe).
+  assertItemsOwnBrands_(items);
   const rows = items.map(it => [
     orderId, date, orderOf, customer, billing,
     it.brand || '', extractSku_(it.sku),
@@ -618,16 +859,19 @@ function api_placeOrder(payload) {
   ]);
   appendRows_(SHEETS.ORDERS.name, rows);
   if (customer) api_addCustomer(customer, billing);
+  rebuildReceivedMaterial_();
+  rebuildSummary_();
   return { orderId, count: rows.length, date };
 }
 
 /**
  * Get orders with filters.
- * filters: { customer, orderOf, status, dateFrom, dateTo, sku }
+ * filters: { customer, billing, orderOf, status, dateFrom, dateTo, sku }
  */
 function api_getOrders(filters) {
   filters = filters || {};
   const cust    = normLoose_(filters.customer);
+  const billing = normLoose_(filters.billing);
   const orderOf = normText_(filters.orderOf);
   const status  = String(filters.status   || '').trim();
   const sku     = normText_(filters.sku).toUpperCase();
@@ -639,6 +883,10 @@ function api_getOrders(filters) {
       const rowCust = normLoose_(o['Customer Name']);
       if (!rowCust) return false;
       if (rowCust.indexOf(cust) < 0 && cust.indexOf(rowCust) < 0) return false;
+    }
+    if (billing) {
+      const rowBilling = normLoose_(o['Billing Name']);
+      if (!rowBilling || (rowBilling.indexOf(billing) < 0 && billing.indexOf(rowBilling) < 0)) return false;
     }
     if (orderOf && normText_(o['Order Of'])       !== orderOf)     return false;
     if (status  && String(o.Status || '').trim() !== status)       return false;
@@ -667,19 +915,24 @@ function api_receiveInward(orderId, sku, qtyReceived, receivedDate) {
   else status = 'Partial';
   sh.getRange(idx + 2, 10, 1, 2).setValues([[newRec, status]]);
   appendRows_(SHEETS.INWARD.name, [[normDate_(receivedDate) || todayStr_(), orderId, skuU, add, 'Ordered']]);
+  rebuildReceivedMaterial_();
+  rebuildSummary_();
   return { orderId, sku: skuU, newRec, status };
 }
 
 /**
  * Bulk inward: rows [{sku, qty}]. Allocates against oldest pending order lines FIFO.
+ * Optional customerName scopes allocation to that customer only.
  * If no open order line exists for a SKU, still records it in Inward as 'Unplanned'
  * so dashboard can surface "Not Ordered" receipts.
  */
-function api_bulkInward(rows, receivedDate) {
+function api_bulkInward(rows, receivedDate, customerName) {
   ensureAllSheets_();
   const orders = sheetData_(SHEETS.ORDERS.name);
   const sh = ss_().getSheetByName(SHEETS.ORDERS.name);
   const rDate = normDate_(receivedDate) || todayStr_();
+  const customerKey = normLoose_(customerName || '');
+  const customerLabel = String(customerName || '').trim();
   const results = [];
   (rows || []).forEach(r => {
     const sku = extractSku_(r.sku);
@@ -688,6 +941,7 @@ function api_bulkInward(rows, receivedDate) {
     const candidates = orders
       .map((o, i) => ({ ...o, _row: i + 2 }))
       .filter(o => String(o.SKU).toUpperCase() === sku && o.Status !== 'Completed')
+      .filter(o => !customerKey || normLoose_(o['Customer Name']) === customerKey)
       .sort((a, b) => new Date(a.Date) - new Date(b.Date));
     for (const c of candidates) {
       if (qty <= 0) break;
@@ -704,9 +958,18 @@ function api_bulkInward(rows, receivedDate) {
     if (qty > 0) {
       // Unplanned inward — no open order matched
       appendRows_(SHEETS.INWARD.name, [[rDate, '', sku, qty, 'Unplanned']]);
-      results.push({ orderId: null, sku, taken: 0, status: 'NOT ORDERED', leftover: qty });
+      results.push({
+        orderId: null,
+        sku,
+        taken: 0,
+        status: 'NOT ORDERED',
+        leftover: qty,
+        customerName: customerLabel || '',
+      });
     }
   });
+  rebuildReceivedMaterial_();
+  rebuildSummary_();
   return results;
 }
 
@@ -729,6 +992,18 @@ function api_getOpenOrderLines(filters) {
     pending: (Number(o['Qty Ordered']) || 0) - (Number(o['Qty Received']) || 0),
     status: o.Status,
   }));
+}
+
+function api_getInwardFilterOptions(customer) {
+  const seen = new Set();
+  return api_getOrders({ customer: customer || '' })
+    .map(o => String(o.SKU || '').trim().toUpperCase())
+    .filter(sku => {
+      if (!sku || seen.has(sku)) return false;
+      seen.add(sku);
+      return true;
+    })
+    .sort();
 }
 
 function api_getInwardHistory(filters) {
@@ -790,6 +1065,82 @@ function api_getOrderSummary(filters) {
   })).sort((a, b) => a.customer.localeCompare(b.customer));
 
   return { rows: orders, byCustomer, customers };
+}
+
+/**
+ * Lightweight call: returns only the sorted unique customer names from column D of Orders.
+ * Used to populate the Order Summary customer dropdown independently of the heavy summary query.
+ */
+function api_getOrderCustomers() {
+  const all = sheetData_(SHEETS.ORDERS.name);
+  const seen = new Set();
+  const customers = [];
+  all.forEach(function(o) {
+    const raw = String(o['Customer Name'] || '').trim();
+    if (!raw) return;
+    const key = raw.toUpperCase().replace(/\s+/g, '');
+    if (seen.has(key)) return;
+    seen.add(key);
+    customers.push(raw);
+  });
+  customers.sort();
+  return customers;
+}
+
+function api_getOrderBillingNames() {
+  const all = sheetData_(SHEETS.ORDERS.name);
+  const seen = new Set();
+  const billingNames = [];
+  all.forEach(function(o) {
+    const raw = String(o['Billing Name'] || '').trim();
+    if (!raw) return;
+    const key = normLoose_(raw);
+    if (seen.has(key)) return;
+    seen.add(key);
+    billingNames.push(raw);
+  });
+  billingNames.sort();
+  return billingNames;
+}
+
+/**
+ * Aggregated Order Summary rows for the "Summary Sheet" table, computed live
+ * from the Orders sheet (via api_getOrders) so every filter it supports —
+ * Customer Name, SKU, Billing Name, Order Of, Status, and date range — applies
+ * here too. Grouped by (Customer Name, SKU, Billing Name) so multiple order
+ * lines for the same customer/SKU roll up into one row.
+ * Returns [{customerName, sku, qtyOrdered, received, status, billingName}].
+ */
+function api_getSummaryByCustomer(filters) {
+  filters = filters || {};
+  const orders = api_getOrders(filters);
+  const map = new Map();
+  orders.forEach(function(o) {
+    const customer = String(o['Customer Name'] || '').trim();
+    const sku = String(o.SKU || '').trim().toUpperCase();
+    const billing = String(o['Billing Name'] || '').trim();
+    const key = customer + '\u0001' + sku + '\u0001' + billing;
+    const g = map.get(key) || { customerName: customer, sku: sku, billingName: billing, qtyOrdered: 0, received: 0 };
+    g.qtyOrdered += Number(o['Qty Ordered']) || 0;
+    g.received   += Number(o['Qty Received']) || 0;
+    map.set(key, g);
+  });
+  return Array.from(map.values())
+    .map(function(g) {
+      let status;
+      if (g.received <= 0) status = 'ALL PENDING';
+      else if (g.received >= g.qtyOrdered) status = 'ALL RECEIVED';
+      else status = 'PENDING PIECES (' + (g.qtyOrdered - g.received) + ')';
+      return {
+        customerName: g.customerName,
+        sku:          g.sku,
+        qtyOrdered:   g.qtyOrdered,
+        received:     g.received,
+        status:       status,
+        billingName:  g.billingName,
+      };
+    })
+    .sort(function(a, b) { return a.customerName.localeCompare(b.customerName) || a.sku.localeCompare(b.sku); });
 }
 
 // ---------- Dashboard ----------

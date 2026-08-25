@@ -183,6 +183,17 @@
   .check { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; text-transform: none; letter-spacing: normal; }
   .combo { display: flex; gap: 6px; align-items: center; }
 
+  /* ---------- Customer/billing autocomplete ---------- */
+  .ac-wrap { position: relative; width: 100%; }
+  .ac-menu {
+    position: absolute; top: calc(100% + 4px); left: 0; right: 0; z-index: 40;
+    background: var(--panel); border: 1px solid var(--line-strong); border-radius: 8px;
+    box-shadow: var(--shadow-md); max-height: 220px; overflow-y: auto;
+  }
+  .ac-menu.hidden { display: none; }
+  .ac-item { padding: 8px 12px; font-size: 13px; color: var(--text); cursor: pointer; }
+  .ac-item:hover, .ac-item.active { background: var(--accent-soft); color: var(--accent); }
+
   /* ---------- Buttons ---------- */
   .btn {
     all: unset; cursor: pointer; padding: 10px 16px; border-radius: 8px;
