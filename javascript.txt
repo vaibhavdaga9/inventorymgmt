@@ -153,8 +153,7 @@ async function preloadBrandSkus() {
     if (res && Array.isArray(res.items)) {
       state.brandSkuPreload = res.items.map(it => ({
         ...it,
-        _skuLower: String(it.sku).toLowerCase(),
-        _searchLower: (String(it.sku) + ' ' + String(it.description || '') + ' ' + String(it.brand || '')).toLowerCase(),
+        _searchLower: String(it.sku).toLowerCase(),
       }));
       state.brandSkuPreloadTruncated = !!res.truncated;
     }
@@ -498,13 +497,13 @@ function setupBrandSkuAutocomplete() {
     if (preloadQueryCache.has(needle)) return preloadQueryCache.get(needle);
     let base = null;
     preloadQueryCache.forEach((rows, q) => {
-      if (needle.startsWith(q) && (!base || q.length > base.q.length)) base = { q, rows };
+      if (rows.length < MAX_BRAND_SKU_ITEMS && needle.startsWith(q) && (!base || q.length > base.q.length)) base = { q, rows };
     });
     const source = base ? base.rows : state.brandSkuPreload;
     const out = [];
     for (let i = 0; i < source.length && out.length < MAX_BRAND_SKU_ITEMS; i++) {
       const item = source[i];
-      if ((item._searchLower || item._skuLower).includes(needle)) out.push(item);
+      if (item._searchLower.includes(needle)) out.push(item);
     }
     preloadQueryCache.set(needle, out);
     return out;
@@ -512,7 +511,6 @@ function setupBrandSkuAutocomplete() {
 
   const debouncedSearch = debounce(search, 100);
   input.addEventListener('input', () => {
-    ++state.brandSkuRequest;
     const query = input.value.trim();
     if (!query) { close(); return; }
     if (state.brandSkuPreload) {

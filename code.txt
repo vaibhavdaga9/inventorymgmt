@@ -173,7 +173,7 @@ function resyncCustomersFromOrders_() {
     const existing = customerMap.get(key);
     if (!existing) {
       customerMap.set(key, { name, billing });
-    } else if (billing) {
+    } else if (billing && !existing.billing) {
       existing.billing = billing;
     }
   });
