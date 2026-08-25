@@ -23,6 +23,7 @@ const state = {
   brandSkuDesc: Object.create(null),
   brandSkuRequest: 0,
   brandSkuPreload: null, // null = not loaded yet, [] /array = ready, filtered locally
+  brandSkuPreloadTruncated: false,
 };
 
 /* --------- helpers --------- */
@@ -149,8 +150,13 @@ async function loadAll() {
 async function preloadBrandSkus() {
   try {
     const res = await callGS('api_getAllBrandSkus');
-    if (res && Array.isArray(res.items) && !res.truncated) {
-      state.brandSkuPreload = res.items.map(it => ({ ...it, _skuLower: String(it.sku).toLowerCase() }));
+    if (res && Array.isArray(res.items)) {
+      state.brandSkuPreload = res.items.map(it => ({
+        ...it,
+        _skuLower: String(it.sku).toLowerCase(),
+        _searchLower: (String(it.sku) + ' ' + String(it.description || '') + ' ' + String(it.brand || '')).toLowerCase(),
+      }));
+      state.brandSkuPreloadTruncated = !!res.truncated;
     }
   } catch (e) {
     console.error('preloadBrandSkus error:', e);
@@ -182,6 +188,7 @@ document.addEventListener('DOMContentLoaded', () => {
     populateInwardSkus();
     if ($('inw-cust').value) loadOpenOrderLines();
   });
+  $('inw-bulk-mode').addEventListener('change', onBulkInwardModeChange);
   $('inw-sku').addEventListener('input', debounce(() => {
     if ($('inw-sku').value.trim()) loadOpenOrderLines();
   }, 500));
@@ -192,9 +199,11 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 function resetScreen() {
-  ['inw-from', 'inw-to', 'inw-cust', 'inw-sku', 'ord-from', 'ord-to', 'ord-status',
+  ['inw-from', 'inw-to', 'inw-cust', 'inw-sku', 'inw-bulk-customer', 'ord-from', 'ord-to', 'ord-status',
    'ord-filter-cust', 'sum-customer', 'sum-sku', 'sum-billing', 'sum-orderof', 'sum-status', 'sum-from', 'sum-to']
     .forEach(id => { if ($(id)) $(id).value = ''; });
+  if ($('inw-bulk-mode')) $('inw-bulk-mode').value = 'fifo';
+  onBulkInwardModeChange();
   clearInwardFilters();
   state.pendingItems = [];
   state.inwardParsed = null;
@@ -228,11 +237,26 @@ function populateInwardFilters() {
   const customer = $('inw-cust');
   if (!customer) return;
   const previous = customer.value;
+  const bulkSel = $('inw-bulk-customer');
+  const bulkPrevious = bulkSel ? bulkSel.value : '';
   const names = uniqueCustomerNames();
   customer.innerHTML = '<option value="">All Customers</option>' +
     names.map(name => `<option value="${esc(name)}">${esc(name)}</option>`).join('');
   customer.value = names.includes(previous) ? previous : '';
+  if (bulkSel) {
+    bulkSel.innerHTML = '<option value="">Select customer</option>' +
+      names.map(name => `<option value="${esc(name)}">${esc(name)}</option>`).join('');
+    bulkSel.value = names.includes(bulkPrevious) ? bulkPrevious : '';
+  }
+  onBulkInwardModeChange();
   populateInwardSkus();
+}
+
+function onBulkInwardModeChange() {
+  const mode = ($('inw-bulk-mode') && $('inw-bulk-mode').value) || 'fifo';
+  const wrap = $('inw-bulk-customer-wrap');
+  if (!wrap) return;
+  wrap.classList.toggle('hidden', mode !== 'customer');
 }
 
 async function populateInwardSkus() {
@@ -402,6 +426,7 @@ function setupBrandSkuAutocomplete() {
   // itself now spans every configured brand sheet, so a single cache (not
   // keyed per-brand) is enough.
   let queryCache = new Map();
+  let preloadQueryCache = new Map();
 
   function close() { menu.classList.add('hidden'); activeIdx = -1; }
   function pick(item) {
@@ -453,8 +478,9 @@ function setupBrandSkuAutocomplete() {
     // this is what makes suggestions fast even starting mid-SKU, since there's
     // no per-keystroke server round trip at all.
     if (state.brandSkuPreload) {
-      renderItems(filterPreloaded(needle));
-      return;
+      const local = filterPreloaded(needle);
+      renderItems(local);
+      if (!state.brandSkuPreloadTruncated || local.length >= MAX_BRAND_SKU_ITEMS) return;
     }
     if (tryRenderFromCache(needle)) return;
     try {
@@ -468,11 +494,19 @@ function setupBrandSkuAutocomplete() {
     }
   }
   function filterPreloaded(needle) {
+    if (!needle) return [];
+    if (preloadQueryCache.has(needle)) return preloadQueryCache.get(needle);
+    let base = null;
+    preloadQueryCache.forEach((rows, q) => {
+      if (needle.startsWith(q) && (!base || q.length > base.q.length)) base = { q, rows };
+    });
+    const source = base ? base.rows : state.brandSkuPreload;
     const out = [];
-    for (let i = 0; i < state.brandSkuPreload.length && out.length < MAX_BRAND_SKU_ITEMS; i++) {
-      const item = state.brandSkuPreload[i];
-      if (item._skuLower.includes(needle)) out.push(item);
+    for (let i = 0; i < source.length && out.length < MAX_BRAND_SKU_ITEMS; i++) {
+      const item = source[i];
+      if ((item._searchLower || item._skuLower).includes(needle)) out.push(item);
     }
+    preloadQueryCache.set(needle, out);
     return out;
   }
 
@@ -481,7 +515,11 @@ function setupBrandSkuAutocomplete() {
     ++state.brandSkuRequest;
     const query = input.value.trim();
     if (!query) { close(); return; }
-    if (state.brandSkuPreload) { renderItems(filterPreloaded(query.toLowerCase())); return; }
+    if (state.brandSkuPreload) {
+      const local = filterPreloaded(query.toLowerCase());
+      renderItems(local);
+      if (!state.brandSkuPreloadTruncated || local.length >= MAX_BRAND_SKU_ITEMS) return;
+    }
     // Render instantly from cache while the debounced server search (a no-op
     // if the cache already answered it) is still pending.
     if (!tryRenderFromCache(query.toLowerCase())) close();
@@ -1186,11 +1224,14 @@ async function handleInwardFile(file) {
 async function uploadBulkInward() {
   if (!state.inwardParsed || !state.inwardParsed.length) return;
   const d = $('inw-rdate').value || todayISO();
+  const mode = $('inw-bulk-mode').value || 'fifo';
+  const customerName = mode === 'customer' ? $('inw-bulk-customer').value.trim() : '';
+  if (mode === 'customer' && !customerName) return toast('Select a customer for customer-specific bulk inward.', 'err');
   try {
-    const results = await callGS('api_bulkInward', state.inwardParsed, d);
+    const results = await callGS('api_bulkInward', state.inwardParsed, d, customerName);
     const ok = results.filter(r => r.orderId).length;
     const na = results.filter(r => !r.orderId);
-    toast(`${ok} allocated. ${na.length} un-ordered.`, na.length ? 'warn' : 'ok');
+    toast(`${ok} allocated${customerName ? ` for ${customerName}` : ''}. ${na.length} un-ordered.`, na.length ? 'warn' : 'ok');
     $('inward-preview').textContent += '\n\nResult:\n' + results.map(r =>
       r.orderId ? `${r.sku}: ${r.taken} → ${r.orderId} (${r.status})` : `${r.sku}: NOT ORDERED (${r.leftover})`
     ).join('\n');

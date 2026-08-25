@@ -148,32 +148,40 @@ function normLoose_(s) {
 }
 
 /**
- * The Customers sheet is NOT hand-maintained — it is always rebuilt from the unique
- * "Customer Name" values actually present in the Orders sheet (the real source of truth).
- * This removes stale/old names left over from manual edits and keeps suggestions in
- * sync with what customers really exist. Billing Name is carried over from the most
- * recent order for that customer, if any.
+ * Keeps Customers aligned with Orders while preserving manual master additions.
+ * Order-derived customers are upserted into the Customers sheet, but customers
+ * manually added in Masters are not removed.
  */
 function resyncCustomersFromOrders_() {
+  const existingRows = sheetData_(SHEETS.CUSTOMERS.name);
+  const customerMap = new Map(); // normalised name -> { name, billing }
+  existingRows.forEach(r => {
+    const name = String(r['Customer Name'] || '').trim();
+    if (!name) return;
+    customerMap.set(name.toUpperCase(), {
+      name: name,
+      billing: String(r['Billing Name'] || '').trim(),
+    });
+  });
+
   const orders = sheetData_(SHEETS.ORDERS.name);
-  const billingByCustomer = new Map(); // normalised name -> { name, billing }
   orders.forEach(o => {
     const name = String(o['Customer Name'] || '').trim();
     if (!name) return;
     const key = name.toUpperCase();
     const billing = String(o['Billing Name'] || '').trim();
-    const existing = billingByCustomer.get(key);
+    const existing = customerMap.get(key);
     if (!existing) {
-      billingByCustomer.set(key, { name, billing });
-    } else if (billing && !existing.billing) {
+      customerMap.set(key, { name, billing });
+    } else if (billing) {
       existing.billing = billing;
     }
   });
-  const rows = Array.from(billingByCustomer.values())
+  const rows = Array.from(customerMap.values())
     .sort((a, b) => a.name.localeCompare(b.name))
     .map(c => [c.name, c.billing || '']);
   clearData_(SHEETS.CUSTOMERS.name);
-  appendRows_(SHEETS.CUSTOMERS.name, rows);
+  if (rows.length) appendRows_(SHEETS.CUSTOMERS.name, rows);
 }
 
 // ---------- Rebuild RECEIVED_MATERIAL sheet ----------
@@ -460,9 +468,13 @@ function api_addCustomer(customer, billing) {
   const existing = sheetData_(SHEETS.CUSTOMERS.name);
   const idx = existing.findIndex(r => String(r['Customer Name']).toUpperCase() === String(customer).toUpperCase());
   if (idx >= 0) {
-    if (billing) sh.getRange(idx + 2, 2).setValue(billing);
+    const currentName = String(existing[idx]['Customer Name'] || '').trim();
+    const currentBilling = String(existing[idx]['Billing Name'] || '').trim();
+    const nextName = String(customer).trim() || currentName;
+    const nextBilling = String(billing || '').trim() || currentBilling;
+    sh.getRange(idx + 2, 1, 1, 2).setValues([[nextName, nextBilling]]);
   } else {
-    sh.appendRow([customer, billing || '']);
+    sh.appendRow([String(customer).trim(), String(billing || '').trim()]);
   }
   return api_getMasters();
 }
@@ -910,14 +922,17 @@ function api_receiveInward(orderId, sku, qtyReceived, receivedDate) {
 
 /**
  * Bulk inward: rows [{sku, qty}]. Allocates against oldest pending order lines FIFO.
+ * Optional customerName scopes allocation to that customer only.
  * If no open order line exists for a SKU, still records it in Inward as 'Unplanned'
  * so dashboard can surface "Not Ordered" receipts.
  */
-function api_bulkInward(rows, receivedDate) {
+function api_bulkInward(rows, receivedDate, customerName) {
   ensureAllSheets_();
   const orders = sheetData_(SHEETS.ORDERS.name);
   const sh = ss_().getSheetByName(SHEETS.ORDERS.name);
   const rDate = normDate_(receivedDate) || todayStr_();
+  const customerKey = normLoose_(customerName || '');
+  const customerLabel = String(customerName || '').trim();
   const results = [];
   (rows || []).forEach(r => {
     const sku = extractSku_(r.sku);
@@ -926,6 +941,7 @@ function api_bulkInward(rows, receivedDate) {
     const candidates = orders
       .map((o, i) => ({ ...o, _row: i + 2 }))
       .filter(o => String(o.SKU).toUpperCase() === sku && o.Status !== 'Completed')
+      .filter(o => !customerKey || normLoose_(o['Customer Name']) === customerKey)
       .sort((a, b) => new Date(a.Date) - new Date(b.Date));
     for (const c of candidates) {
       if (qty <= 0) break;
@@ -942,7 +958,14 @@ function api_bulkInward(rows, receivedDate) {
     if (qty > 0) {
       // Unplanned inward — no open order matched
       appendRows_(SHEETS.INWARD.name, [[rDate, '', sku, qty, 'Unplanned']]);
-      results.push({ orderId: null, sku, taken: 0, status: 'NOT ORDERED', leftover: qty });
+      results.push({
+        orderId: null,
+        sku,
+        taken: 0,
+        status: 'NOT ORDERED',
+        leftover: qty,
+        customerName: customerLabel || '',
+      });
     }
   });
   rebuildReceivedMaterial_();

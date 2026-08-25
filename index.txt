@@ -348,9 +348,18 @@
         </div>
         <div class="card">
           <div class="card-head"><h3>Bulk Receive (Any SKU)</h3>
-            <span class="muted">Excel · Col A = SKU · Col B = Qty. Allocates FIFO to open orders. Un-ordered SKUs are recorded as <b>Not Ordered</b> and surfaced on the Dashboard.</span>
+            <span class="muted">Excel · Col A = SKU · Col B = Qty. Use global FIFO, or scope the upload to one customer so inward is allocated only to that customer's matching open lines.</span>
           </div>
           <div class="filter-bar">
+            <div><label>Allocation Mode</label>
+              <select id="inw-bulk-mode">
+                <option value="fifo">FIFO (all customers)</option>
+                <option value="customer">Customer specific</option>
+              </select>
+            </div>
+            <div id="inw-bulk-customer-wrap" class="hidden"><label>Customer Name</label>
+              <select id="inw-bulk-customer"><option value="">Select customer</option></select>
+            </div>
             <div><label>Received Date</label><input type="date" id="inw-rdate"></div>
           </div>
           <div class="uploader">
